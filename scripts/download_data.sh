@@ -49,7 +49,7 @@ curl -fL \
     -o "${DATA_DIR}/${CARDS_FILE}"
 
 curl -fL \
-    "${BASE_URL}/abilities/${ABILITIES_FILE}" \
+    "${BASE_URL}/cards/${ABILITIES_FILE}" \
     -o "${DATA_DIR}/${ABILITIES_FILE}"
 
 echo
