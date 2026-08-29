@@ -1,34 +1,18 @@
-data/
+# Virtual environment
+.venv/
+
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-.venv/
-venv/
-env/
-ENV/
-.env
-.env.*
-!.env.example
-build/
-dist/
-*.egg-info/
-.eggs/
-pip-wheel-metadata/
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-.mypy_cache/
-.pyright/
-.ruff_cache/
+
+# Jupyter
 .ipynb_checkpoints/
+
+# Local data / databases
+data/
+*.duckdb
+*.duckdb.wal
+
+# IDE
 .idea/
-*.iml
-*.ipr
-*.iws
 .vscode/
-.DS_Store
-tmp/
-temp/

@@ -5,3 +5,7 @@ ipykernel
 matplotlib
 scikit-learn
 duckdb
+gensim
+scipy
+scipy-stubs
+scikit-learn
