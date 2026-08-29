@@ -8,4 +8,3 @@ duckdb
 gensim
 scipy
 scipy-stubs
-scikit-learn
