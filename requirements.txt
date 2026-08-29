@@ -8,3 +8,5 @@ duckdb
 gensim
 scipy
 scipy-stubs
+boto3
+requests
