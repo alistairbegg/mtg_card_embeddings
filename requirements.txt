@@ -4,3 +4,4 @@ jupyter
 ipykernel
 matplotlib
 scikit-learn
+duckdb
