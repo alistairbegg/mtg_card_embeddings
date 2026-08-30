@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
-"""Build a normalized DuckDB from public 17Lands draft/game/replay dataset triples.
+"""Build a normalized DuckDB from public 17Lands game/replay dataset pairs.
 
-By default every matching draft/game/replay triple in the data directory is processed.
-Pass --dataset-suffix to restrict ingestion to one dataset. Draft data is ingested
-first, restricted to draft IDs that actually occur in the game file. The existing
-game/replay phase remains resumable: a batch is selected from the game CSV, the
-replay CSV is rescanned until those exact natural game keys are found, and all rows
-derived from that batch are committed in one DuckDB transaction together with the
-checkpoint.
+By default every matching game/replay pair in the data directory is processed. Pass
+--dataset-suffix to restrict ingestion to one dataset. Ingestion is resumable. A
+batch is selected from the game CSV, the replay CSV is
+rescanned until those exact natural game keys are found, and all rows derived from
+that batch are committed in one DuckDB transaction together with the checkpoint.
 If the process stops before commit, rerunning repeats only that batch. If it stops
 after commit, rerunning continues at the next game row.
 
@@ -36,11 +34,6 @@ from typing import Any, Iterable, Iterator
 import duckdb
 import numpy as np
 import pandas as pd
-
-try:
-    from scripts.add_draft_data import ensure_draft_schema, ingest_draft_file
-except ModuleNotFoundError:  # Supports direct execution as scripts/build_db.py.
-    from add_draft_data import ensure_draft_schema, ingest_draft_file
 
 
 LOG = logging.getLogger("17lands-db")
@@ -282,7 +275,6 @@ class EventRule:
 @dataclass(frozen=True)
 class Paths:
     dataset_id: str
-    draft_file: Path
     game_file: Path
     replay_file: Path
     cards_file: Path
@@ -312,16 +304,12 @@ class DatabaseBuilder:
         overwrite: bool,
         max_batches: int | None,
         replay_progress_every: int,
-        draft_chunk_size: int,
-        max_draft_batches: int | None,
     ) -> None:
         self.paths = paths
         self.batch_size = batch_size
         self.overwrite = overwrite
         self.max_batches = max_batches
         self.replay_progress_every = replay_progress_every
-        self.draft_chunk_size = draft_chunk_size
-        self.max_draft_batches = max_draft_batches
 
         self.game_columns = read_header(paths.game_file)
         self.replay_columns = read_header(paths.replay_file)
@@ -343,10 +331,6 @@ class DatabaseBuilder:
             raise ValueError("--batch-size must be positive")
         if self.max_batches is not None and self.max_batches <= 0:
             raise ValueError("--max-batches must be positive")
-        if self.draft_chunk_size <= 0:
-            raise ValueError("--draft-chunk-size must be positive")
-        if self.max_draft_batches is not None and self.max_draft_batches <= 0:
-            raise ValueError("--max-draft-batches must be positive")
 
         validate_required_columns(self.game_columns, self.replay_columns, self.candidate_columns)
         validate_turn_schema(self.turn_columns)
@@ -365,32 +349,8 @@ class DatabaseBuilder:
         con = duckdb.connect(str(self.paths.output))
         try:
             con.execute(SCHEMA_SQL)
-            ensure_draft_schema(con)
             validate_database_schema(con)
             self.sync_reference_tables(con, helper_cards, helper_abilities)
-
-            # Draft data is the parent phase. Restrict it to drafts that actually
-            # appear in this dataset's game file, so the database never gains
-            # unrelated public-dump drafts merely because they share a source file.
-            game_backed_draft_ids = collect_game_draft_ids(self.paths.game_file)
-            LOG.info("Game-backed draft IDs in %s: %d", self.paths.dataset_id, len(game_backed_draft_ids))
-            draft_complete = ingest_draft_file(
-                con,
-                self.paths.draft_file,
-                dataset_id=self.paths.dataset_id,
-                allowed_draft_ids=game_backed_draft_ids,
-                existing_only=False,
-                chunk_size=self.draft_chunk_size,
-                max_batches=self.max_draft_batches,
-                require_all=True,
-            )
-            if not draft_complete:
-                LOG.info(
-                    "Draft phase for %s stopped cleanly; rerun the same command to resume before game ingestion.",
-                    self.paths.dataset_id,
-                )
-                return
-
             checkpoint = self.load_or_create_checkpoint(con, game_signature, replay_signature)
 
             if checkpoint.completed:
@@ -1464,12 +1424,7 @@ def validate_database_schema(con: duckdb.DuckDBPyConnection) -> None:
         "games": {"game_id", "draft_id", "build_id", "source_num_turns"},
         "turns": {"turn_id", "game_id", "is_user_turn", "source_turn_index"},
         "events": {"event_id", "source_turn_id", "actual_turn_id", "actor_is_user"},
-        "draft_picks": {"draft_pick_id", "draft_id", "source_pack_number", "source_pick_number"},
-        "draft_pick_selections": {"draft_pick_id", "selection_number", "card_id"},
-        "draft_pick_options": {"draft_pick_id", "card_id", "quantity"},
-        "draft_pick_pool_cards": {"draft_pick_id", "card_id", "quantity"},
         "ingestion_checkpoints": {"dataset_id", "next_game_row", "completed"},
-        "draft_ingestion_checkpoints": {"dataset_id", "next_draft_row", "completed"},
     }
     for table, columns in required.items():
         existing = {row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
@@ -1597,21 +1552,6 @@ def extract_replay_rows(
             f"Replay scan ended with {len(missing)} game rows missing; first keys: {missing[:10]}"
         )
     return pd.DataFrame([found[key] for key in ordered_keys], columns=wanted_columns), rows_scanned
-
-
-def collect_game_draft_ids(game_file: Path, chunk_size: int = 100_000) -> set[str]:
-    result: set[str] = set()
-    for chunk in pd.read_csv(
-        game_file,
-        usecols=["draft_id"],
-        dtype="string",
-        chunksize=chunk_size,
-        low_memory=False,
-    ):
-        result.update(chunk["draft_id"].dropna().astype(str))
-    if not result:
-        raise ValueError(f"No draft IDs found in game file {game_file}")
-    return result
 
 
 def iter_game_batches(
@@ -2025,47 +1965,39 @@ def derive_dataset_id(game_file: Path, replay_file: Path, requested: str | None)
 def discover_dataset_pairs(
     data_dir: Path,
     suffix: str | None,
-) -> list[tuple[str, Path, Path, Path]]:
-    draft_files = sorted(data_dir.glob("draft_data_public.*.csv.gz"))
+) -> list[tuple[str, Path, Path]]:
     game_files = sorted(data_dir.glob("game_data_public.*.csv.gz"))
     replay_files = sorted(data_dir.glob("replay_data_public.*.csv.gz"))
 
     def extract(path: Path, prefix: str) -> str:
         return path.name[len(prefix):-len(".csv.gz")]
 
-    drafts = {extract(path, "draft_data_public."): path for path in draft_files}
     games = {extract(path, "game_data_public."): path for path in game_files}
     replays = {extract(path, "replay_data_public."): path for path in replay_files}
-    common = sorted(set(drafts) & set(games) & set(replays))
+    common = sorted(set(games) & set(replays))
 
     if suffix is not None:
         if suffix not in common:
-            raise ValueError(f"No matching draft/game/replay triple for dataset suffix {suffix!r}")
-        return [(suffix, drafts[suffix], games[suffix], replays[suffix])]
+            raise ValueError(f"No matching game/replay pair for dataset suffix {suffix!r}")
+        return [(suffix, games[suffix], replays[suffix])]
 
     if not common:
-        raise ValueError(f"No matching draft/game/replay dataset triples found in {data_dir}")
+        raise ValueError(f"No matching game/replay dataset pairs found in {data_dir}")
 
-    all_suffixes = set(drafts) | set(games) | set(replays)
-    incomplete = sorted(all_suffixes - set(common))
-    if incomplete:
-        LOG.warning(
-            "Ignoring %d dataset(s) without a complete draft/game/replay triple: %s",
-            len(incomplete),
-            incomplete[:10],
-        )
+    game_only = sorted(set(games) - set(replays))
+    replay_only = sorted(set(replays) - set(games))
+    if game_only:
+        LOG.warning("Ignoring %d game dataset(s) without replay files: %s", len(game_only), game_only[:10])
+    if replay_only:
+        LOG.warning("Ignoring %d replay dataset(s) without game files: %s", len(replay_only), replay_only[:10])
 
-    return [
-        (dataset_suffix, drafts[dataset_suffix], games[dataset_suffix], replays[dataset_suffix])
-        for dataset_suffix in common
-    ]
+    return [(dataset_suffix, games[dataset_suffix], replays[dataset_suffix]) for dataset_suffix in common]
 
 
 def resolve_datasets(args: argparse.Namespace) -> list[Paths]:
     data_dir = Path(args.data_dir).expanduser().resolve()
-    manual_files = (args.draft_file, args.game_file, args.replay_file)
-    if any(manual_files) and not all(manual_files):
-        raise ValueError("Pass --draft-file, --game-file, and --replay-file together, or none of them")
+    if bool(args.game_file) != bool(args.replay_file):
+        raise ValueError("Pass both --game-file and --replay-file, or neither")
 
     cards_file = Path(args.cards_file).expanduser().resolve() if args.cards_file else data_dir / "cards.csv"
     abilities_file = (
@@ -2076,10 +2008,9 @@ def resolve_datasets(args: argparse.Namespace) -> list[Paths]:
     output = Path(args.output).expanduser().resolve() if args.output else data_dir / "17lands.duckdb"
 
     if args.game_file:
-        draft_file = Path(args.draft_file).expanduser().resolve()
         game_file = Path(args.game_file).expanduser().resolve()
         replay_file = Path(args.replay_file).expanduser().resolve()
-        pairs = [(args.dataset_suffix, draft_file, game_file, replay_file)]
+        pairs = [(args.dataset_suffix, game_file, replay_file)]
     else:
         pairs = discover_dataset_pairs(data_dir, args.dataset_suffix)
 
@@ -2091,8 +2022,8 @@ def resolve_datasets(args: argparse.Namespace) -> list[Paths]:
             raise FileNotFoundError(path)
 
     resolved = []
-    for discovered_suffix, draft_file, game_file, replay_file in pairs:
-        for path in (draft_file, game_file, replay_file):
+    for discovered_suffix, game_file, replay_file in pairs:
+        for path in (game_file, replay_file):
             if not path.exists():
                 raise FileNotFoundError(path)
         dataset_id = derive_dataset_id(
@@ -2103,7 +2034,6 @@ def resolve_datasets(args: argparse.Namespace) -> list[Paths]:
         resolved.append(
             Paths(
                 dataset_id=dataset_id,
-                draft_file=draft_file,
                 game_file=game_file,
                 replay_file=replay_file,
                 cards_file=cards_file,
@@ -2118,24 +2048,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--dataset-suffix")
     parser.add_argument("--dataset-id")
-    parser.add_argument("--draft-file")
     parser.add_argument("--game-file")
     parser.add_argument("--replay-file")
     parser.add_argument("--cards-file")
     parser.add_argument("--abilities-file")
     parser.add_argument("--output")
     parser.add_argument("--batch-size", type=int, default=1_000)
-    parser.add_argument(
-        "--draft-chunk-size",
-        type=int,
-        default=2_000,
-        help="Rows per source chunk during the draft phase.",
-    )
-    parser.add_argument(
-        "--max-draft-batches",
-        type=int,
-        help="Process at most this many new draft chunks, then stop cleanly before game ingestion.",
-    )
     parser.add_argument(
         "--max-batches",
         type=int,
@@ -2164,7 +2082,6 @@ def main() -> None:
 
     for index, paths in enumerate(datasets, start=1):
         LOG.info("Dataset %d/%d: %s", index, len(datasets), paths.dataset_id)
-        LOG.info("Draft CSV: %s", paths.draft_file)
         LOG.info("Game CSV: %s", paths.game_file)
         LOG.info("Replay CSV: %s", paths.replay_file)
         DatabaseBuilder(
@@ -2173,8 +2090,6 @@ def main() -> None:
             overwrite=args.overwrite and index == 1,
             max_batches=args.max_batches,
             replay_progress_every=args.replay_progress_every,
-            draft_chunk_size=args.draft_chunk_size,
-            max_draft_batches=args.max_draft_batches,
         ).run()
 
 
