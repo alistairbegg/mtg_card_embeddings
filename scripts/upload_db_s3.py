@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
+from botocore.config import Config
 import duckdb
 
 
@@ -170,7 +171,13 @@ def main() -> None:
 
     manifest = build_manifest()
 
-    s3 = boto3.client("s3")
+    session = boto3.Session()
+
+    s3 = session.client(
+        "s3",
+        region_name="eu-west-2",
+        config=Config(signature_version="s3v4"),
+    )
 
     upload_database(
         s3,
