@@ -16,6 +16,7 @@ BASE_URL="https://17lands-public.s3.amazonaws.com/analysis_data"
 
 mkdir -p "$DATA_DIR"
 
+DRAFT_FILE="draft_data_public.${SET}.${FORMAT}.csv.gz"
 GAME_FILE="game_data_public.${SET}.${FORMAT}.csv.gz"
 REPLAY_FILE="replay_data_public.${SET}.${FORMAT}.csv.gz"
 
@@ -23,6 +24,14 @@ CARDS_FILE="cards.csv"
 ABILITIES_FILE="abilities.csv"
 
 echo "Downloading 17Lands data for ${SET} (${FORMAT})..."
+
+# ------------------------------------------------------------------
+# Draft data
+# ------------------------------------------------------------------
+
+curl -fL \
+    "${BASE_URL}/draft_data/${DRAFT_FILE}" \
+    -o "${DATA_DIR}/${DRAFT_FILE}"
 
 # ------------------------------------------------------------------
 # Game data
@@ -54,6 +63,7 @@ curl -fL \
 
 echo
 echo "Downloads complete:"
+echo "  ${DATA_DIR}/${DRAFT_FILE}"
 echo "  ${DATA_DIR}/${GAME_FILE}"
 echo "  ${DATA_DIR}/${REPLAY_FILE}"
 echo "  ${DATA_DIR}/${CARDS_FILE}"
