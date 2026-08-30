@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import subprocess
@@ -7,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
-from botocore.config import Config
 import duckdb
+from botocore.config import Config
 
 
 # ------------------------------------------------------------------
@@ -19,6 +20,7 @@ DB_PATH = Path("data/17lands.duckdb")
 
 S3_BUCKET = "alistairbegg-personal-projects"
 S3_PREFIX = "mtg_card_embeddings/data"
+AWS_REGION = "eu-west-2"
 
 DATABASE_KEY = f"{S3_PREFIX}/17lands.duckdb"
 MANIFEST_KEY = f"{S3_PREFIX}/manifest.json"
@@ -32,6 +34,53 @@ PRESIGNED_URL_EXPIRY_SECONDS = 7 * 24 * 60 * 60
 # Read the database in chunks when calculating its checksum rather
 # than loading the whole file into memory.
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
+
+
+# ------------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Upload the local DuckDB snapshot to S3 and generate a "
+            "presigned download URL."
+        )
+    )
+
+    parser.add_argument(
+        "--url-only",
+        action="store_true",
+        help=(
+            "Do not upload anything. Generate a new presigned URL "
+            "for the database already stored in S3."
+        ),
+    )
+
+    return parser.parse_args()
+
+
+# ------------------------------------------------------------------
+# AWS
+# ------------------------------------------------------------------
+
+def create_s3_client():
+    """
+    Create an S3 client using AWS Signature Version 4.
+
+    Credentials are resolved normally by boto3. For example:
+
+        AWS_PROFILE=personal uv run python -m scripts.upload_db_s3
+
+    On EC2, an attached IAM role can be used instead.
+    """
+    session = boto3.Session()
+
+    return session.client(
+        "s3",
+        region_name=AWS_REGION,
+        config=Config(signature_version="s3v4"),
+    )
 
 
 # ------------------------------------------------------------------
@@ -162,6 +211,32 @@ def generate_download_url(s3) -> str:
 # ------------------------------------------------------------------
 
 def main() -> None:
+    args = parse_args()
+
+    s3 = create_s3_client()
+
+    # --------------------------------------------------------------
+    # URL-only mode
+    # --------------------------------------------------------------
+
+    if args.url_only:
+        download_url = generate_download_url(s3)
+
+        print("Presigned download URL:")
+        print(download_url)
+
+        print()
+        print(
+            "This URL expires in "
+            f"{PRESIGNED_URL_EXPIRY_SECONDS // 86400} days."
+        )
+
+        return
+
+    # --------------------------------------------------------------
+    # Normal upload mode
+    # --------------------------------------------------------------
+
     if not DB_PATH.exists():
         raise FileNotFoundError(
             f"Database does not exist: {DB_PATH}"
@@ -170,14 +245,6 @@ def main() -> None:
     checkpoint_database()
 
     manifest = build_manifest()
-
-    session = boto3.Session()
-
-    s3 = session.client(
-        "s3",
-        region_name="eu-west-2",
-        config=Config(signature_version="s3v4"),
-    )
 
     upload_database(
         s3,
@@ -189,6 +256,7 @@ def main() -> None:
     print()
     print("Upload complete.")
     print()
+
     print("Snapshot:")
     print(json.dumps(manifest, indent=2))
 
