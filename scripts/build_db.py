@@ -353,11 +353,7 @@ def upsert_draft_metadata(
             source = row[field]
             if source is None:
                 continue
-            equal = (
-                pd.Timestamp(stored) == pd.Timestamp(source)
-                if field == "draft_time" and stored is not None
-                else stored == source
-            )
+            equal = values_equal((stored,), (source,))
             if stored is not None and not equal:
                 raise ValueError(
                     f"Draft metadata changed for {draft_id}: "
@@ -489,10 +485,7 @@ def ingest_draft_data(
                     stored = previous.get(field)
                     if stored is None:
                         previous[field] = incoming
-                    elif field == "draft_time":
-                        if pd.Timestamp(stored) != pd.Timestamp(incoming):
-                            raise ValueError(f"Conflicting {field} within draft {draft_id}")
-                    elif stored != incoming:
+                    elif not values_equal((stored,), (incoming,)):
                         raise ValueError(f"Conflicting {field} within draft {draft_id}")
 
             found_drafts.add(draft_id)
@@ -2261,8 +2254,16 @@ def values_equal(left: Iterable[Any], right: Iterable[Any]) -> bool:
     for a, b in zip(left, right, strict=True):
         if a is None and b is None:
             continue
+        if a is None or b is None:
+            return False
         if isinstance(a, pd.Timestamp) or isinstance(b, pd.Timestamp):
             if pd.Timestamp(a) != pd.Timestamp(b):
+                return False
+        elif isinstance(a, (float, np.floating)) or isinstance(b, (float, np.floating)):
+            # DuckDB REAL is IEEE float32, so a source value such as 0.48 is
+            # returned as 0.47999998927116394. Treat normal float32 roundoff
+            # as equal while still rejecting materially different values.
+            if not np.isclose(float(a), float(b), rtol=1e-6, atol=1e-7):
                 return False
         elif a != b:
             return False
