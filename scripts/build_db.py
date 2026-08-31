@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build a normalized DuckDB from public 17Lands draft/game/replay data.
 
-For each dataset the builder first streams the draft file and imports pick history
-for drafts that have games. It then streams the game file in batches of complete
-drafts. Each batch is matched to replay rows using the same targeted CSV scan pattern
-as the original game-first builder, and each draft is committed atomically.
+For each dataset the builder works in batches of draft IDs. For each batch it first
+streams the draft CSV and loads picks for those drafts, then gathers all game rows for
+those drafts, then scans the replay CSV for those exact games and imports their
+replay-derived hands, turns, states, zones and events. It then moves to the next batch.
 
 The database preserves source truth rather than reconstructing ambiguous chronology.
 The N in user_turn_N / oppo_turn_N is stored as source_turn_index. Every event keeps
@@ -277,7 +277,6 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
     draft_signature VARCHAR NOT NULL,
     game_signature VARCHAR NOT NULL,
     replay_signature VARCHAR NOT NULL,
-    draft_phase_complete BOOLEAN NOT NULL,
     next_draft_index BIGINT NOT NULL,
     committed_drafts BIGINT NOT NULL,
     completed BOOLEAN NOT NULL,
@@ -386,15 +385,20 @@ def clear_partial_draft_picks(
         con.unregister("_target_drafts")
 
 
-def ingest_draft_data(
+def ingest_draft_batch(
     con: duckdb.DuckDBPyConnection,
     draft_file: Path,
     draft_header: list[str],
-    allowed_draft_ids: set[str],
+    target_draft_ids: set[str],
     card_name_to_id: dict[str, int],
-    drafts_per_commit: int,
 ) -> None:
-    """Stream draft rows directly; source rows need not be grouped by draft."""
+    """Replace draft picks for one outer batch of draft IDs.
+
+    The draft CSV is streamed with csv.reader so the very wide source never becomes
+    a pandas DataFrame. The ingestion checkpoint is deliberately not advanced here:
+    if the process stops before the matching games are committed, rerunning the same
+    outer batch clears and rebuilds only these draft picks.
+    """
     index = {column: position for position, column in enumerate(draft_header)}
     missing = DRAFT_REQUIRED_COLUMNS - set(index)
     if missing:
@@ -417,14 +421,19 @@ def ingest_draft_data(
         position = index.get(column)
         return None if position is None else row[position]
 
-    # A few hundred picks keeps the potentially much larger pick-card list bounded.
-    rows_per_commit = max(250, drafts_per_commit * 10)
+    # A failed/rerun batch can have draft picks already present even though its game
+    # checkpoint did not advance. Replace just this batch before streaming it again.
+    clear_partial_draft_picks(con, target_draft_ids)
+
     draft_rows: dict[str, dict[str, Any]] = {}
     pick_rows: list[dict[str, Any]] = []
     pick_card_rows: list[dict[str, Any]] = []
     found_drafts: set[str] = set()
+    seen_pick_ids: set[int] = set()
+    total_picks = 0
 
-    def commit_batch() -> None:
+    def commit_rows() -> None:
+        nonlocal total_picks
         if not pick_rows:
             return
         con.execute("BEGIN")
@@ -448,7 +457,7 @@ def ingest_draft_data(
         except BaseException:
             con.execute("ROLLBACK")
             raise
-        LOG.info("Imported %d draft picks.", len(pick_rows))
+        total_picks += len(pick_rows)
         draft_rows.clear()
         pick_rows.clear()
         pick_card_rows.clear()
@@ -461,7 +470,7 @@ def ingest_draft_data(
 
         for row in reader:
             draft_id = row[index["draft_id"]]
-            if draft_id not in allowed_draft_ids:
+            if draft_id not in target_draft_ids:
                 continue
 
             metadata = {
@@ -494,6 +503,11 @@ def ingest_draft_data(
             picked_name = normalize_card_name(row[index["pick"]])
             picked_id = card_name_to_id[picked_name]
             pick_id = make_pick_id(draft_id, pack_number, pick_number)
+            if pick_id in seen_pick_ids:
+                raise ValueError(
+                    f"Duplicate draft pick for {draft_id} pack={pack_number} pick={pick_number}"
+                )
+            seen_pick_ids.add(pick_id)
 
             card_counts: dict[int, list[int]] = {}
             picked_offered = False
@@ -532,17 +546,23 @@ def ingest_draft_data(
                 for card_id, counts in card_counts.items()
             )
 
-            if len(pick_rows) >= rows_per_commit:
-                commit_batch()
+            # Keep Python object growth bounded even when a batch contains many picks.
+            if len(pick_rows) >= 500:
+                commit_rows()
 
-    commit_batch()
+    commit_rows()
 
-    missing_drafts = allowed_draft_ids - found_drafts
+    missing_drafts = target_draft_ids - found_drafts
     if missing_drafts:
         raise ValueError(
             f"Draft CSV is missing {len(missing_drafts)} game-backed drafts; "
             f"first: {sorted(missing_drafts)[:10]}"
         )
+    LOG.info(
+        "Loaded draft data for %d drafts (%d picks).",
+        len(found_drafts),
+        total_picks,
+    )
 
 
 @dataclass(frozen=True)
@@ -574,7 +594,6 @@ class ReferenceData:
 
 @dataclass(frozen=True)
 class Checkpoint:
-    draft_phase_complete: bool
     next_draft_index: int
     committed_drafts: int
     completed: bool
@@ -640,44 +659,18 @@ class DatabaseBuilder:
             self.paths.game_file,
             self.game_columns,
         )
-        allowed_draft_ids = set(ordered_draft_ids)
 
         con = duckdb.connect(str(self.paths.output))
         try:
             con.execute(SCHEMA_SQL)
             validate_database_schema(con)
             self.sync_reference_tables(con, helper_cards, helper_abilities)
-            del helper_cards, helper_abilities
             checkpoint = self.load_or_create_checkpoint(
                 con,
                 draft_signature,
                 game_signature,
                 replay_signature,
             )
-
-            if not checkpoint.draft_phase_complete:
-                clear_partial_draft_picks(con, allowed_draft_ids)
-                ingest_draft_data(
-                    con,
-                    self.paths.draft_file,
-                    self.draft_columns,
-                    allowed_draft_ids,
-                    self.reference.card_name_to_id,
-                    min(self.batch_size, 50),
-                )
-                con.execute(
-                    "UPDATE ingestion_checkpoints "
-                    "SET draft_phase_complete = TRUE, updated_at = current_timestamp "
-                    "WHERE dataset_id = ?",
-                    [self.paths.dataset_id],
-                )
-                con.execute("CHECKPOINT")
-                checkpoint = Checkpoint(
-                    draft_phase_complete=True,
-                    next_draft_index=checkpoint.next_draft_index,
-                    committed_drafts=checkpoint.committed_drafts,
-                    completed=checkpoint.completed,
-                )
 
             if checkpoint.completed:
                 LOG.info("Dataset %s is already complete.", self.paths.dataset_id)
@@ -700,6 +693,20 @@ class DatabaseBuilder:
                 self.batch_size,
                 checkpoint.next_draft_index,
             ):
+                LOG.info(
+                    "Draft batch %d..%d: loading draft picks for %d drafts.",
+                    batch_start,
+                    batch_start + len(batch_ids) - 1,
+                    len(batch_ids),
+                )
+                ingest_draft_batch(
+                    con,
+                    self.paths.draft_file,
+                    self.draft_columns,
+                    set(batch_ids),
+                    self.reference.card_name_to_id,
+                )
+
                 ordered_keys = game_keys(game_batch)
                 replay_batch, scanned = extract_replay_rows(
                     self.paths.replay_file,
@@ -719,10 +726,11 @@ class DatabaseBuilder:
                 draft_values = game_batch["draft_id"].astype(str).to_numpy()
                 for offset, draft_id in enumerate(batch_ids):
                     positions = np.flatnonzero(draft_values == draft_id)
+                    if not len(positions):
+                        raise ValueError(f"No game rows found for expected draft {draft_id}")
                     draft_games = game_batch.iloc[positions].reset_index(drop=True)
                     draft_replays = replay_batch.iloc[positions].reset_index(drop=True)
                     current = Checkpoint(
-                        draft_phase_complete=True,
                         next_draft_index=batch_start + offset,
                         committed_drafts=batch_start + offset,
                         completed=False,
@@ -733,7 +741,6 @@ class DatabaseBuilder:
                 con.execute("CHECKPOINT")
 
             final_checkpoint = Checkpoint(
-                draft_phase_complete=True,
                 next_draft_index=next_index,
                 committed_drafts=next_index,
                 completed=False,
@@ -862,8 +869,7 @@ class DatabaseBuilder:
         row = con.execute(
             """
             SELECT draft_signature, game_signature, replay_signature,
-                   draft_phase_complete, next_draft_index,
-                   committed_drafts, completed
+                   next_draft_index, committed_drafts, completed
             FROM ingestion_checkpoints
             WHERE dataset_id = ?
             """,
@@ -876,9 +882,8 @@ class DatabaseBuilder:
                 INSERT INTO ingestion_checkpoints (
                     dataset_id, draft_file, game_file, replay_file,
                     draft_signature, game_signature, replay_signature,
-                    draft_phase_complete, next_draft_index,
-                    committed_drafts, completed, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, 0, 0, FALSE, current_timestamp)
+                    next_draft_index, committed_drafts, completed, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, FALSE, current_timestamp)
                 """,
                 [
                     self.paths.dataset_id,
@@ -891,9 +896,9 @@ class DatabaseBuilder:
                 ],
             )
             con.execute("CHECKPOINT")
-            return Checkpoint(False, 0, 0, False)
+            return Checkpoint(0, 0, False)
 
-        saved_draft, saved_game, saved_replay, draft_done, next_index, committed, completed = row
+        saved_draft, saved_game, saved_replay, next_index, committed, completed = row
         if (saved_draft, saved_game, saved_replay) != (
             draft_signature,
             game_signature,
@@ -903,12 +908,7 @@ class DatabaseBuilder:
                 "Checkpoint file signatures do not match the current draft/game/replay files. "
                 "Use the original files or rebuild with --overwrite."
             )
-        return Checkpoint(
-            bool(draft_done),
-            int(next_index),
-            int(committed),
-            bool(completed),
-        )
+        return Checkpoint(int(next_index), int(committed), bool(completed))
 
     def process_draft(
         self,
@@ -1782,7 +1782,7 @@ def validate_database_schema(con: duckdb.DuckDBPyConnection) -> None:
         "games": {"game_id", "draft_id", "build_id", "source_num_turns"},
         "turns": {"turn_id", "game_id", "is_user_turn", "source_turn_index"},
         "events": {"event_id", "source_turn_id", "actual_turn_id", "actor_is_user"},
-        "ingestion_checkpoints": {"dataset_id", "draft_phase_complete", "next_draft_index", "committed_drafts", "completed"},
+        "ingestion_checkpoints": {"dataset_id", "next_draft_index", "committed_drafts", "completed"},
     }
     for table, columns in required.items():
         existing = {row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
@@ -2475,8 +2475,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=150,
-        help="Number of complete drafts processed per game/replay source scan.",
+        default=100,
+        help="Number of drafts processed together through draft/game/replay source scans.",
     )
     parser.add_argument(
         "--replay-progress-every",
