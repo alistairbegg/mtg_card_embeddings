@@ -10,6 +10,7 @@ dependencies = [
     "gensim>=4.4.0",
     "ipykernel>=7.3.0",
     "jupyter>=1.1.1",
+    "jupyterlab>=4.6.3",
     "matplotlib>=3.11.1",
     "numpy>=2.5.2",
     "pandas>=3.0.5",
