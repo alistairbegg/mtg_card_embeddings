@@ -1557,8 +1557,13 @@ class DatabaseBuilder:
 
                 offered_position = pack_position_by_card_id.get(picked_id)
                 if offered_position is None:
-                    raise ValueError(
-                        f"Selected card {picked_name!r} has no offered-pack column for {draft_id}"
+                    LOG.warning(
+                        "Source inconsistency: selected card %r has no offered-pack column "
+                        "for draft %s pack=%s pick=%s; preserving source values.",
+                        picked_name,
+                        draft_id,
+                        pack_number,
+                        pick_number,
                     )
 
                 card_counts: dict[int, list[int]] = {}
@@ -1568,12 +1573,17 @@ class DatabaseBuilder:
                     assert pack_card_ids_tail is not None and pool_card_ids_tail is not None
                     pack_counts = tail_counts[pack_offsets_from_tail]
                     pool_counts = tail_counts[pool_offsets_from_tail]
-                    offered_offset = offered_position - draft_tail_start
-                    if offered_offset < 0 or offered_offset >= len(tail_counts) or int(tail_counts[offered_offset]) <= 0:
-                        raise ValueError(
-                            f"Selected card {picked_name!r} not offered for {draft_id} "
-                            f"pack={pack_number} pick={pick_number}"
-                        )
+                    if offered_position is not None:
+                        offered_offset = offered_position - draft_tail_start
+                        if offered_offset < 0 or offered_offset >= len(tail_counts) or int(tail_counts[offered_offset]) <= 0:
+                            LOG.warning(
+                                "Source inconsistency: selected card %r not present in offered pack "
+                                "for draft %s pack=%s pick=%s; preserving source values.",
+                                picked_name,
+                                draft_id,
+                                pack_number,
+                                pick_number,
+                            )
                     for offset_raw in np.flatnonzero(pack_counts):
                         offset = int(offset_raw)
                         card_counts[int(pack_card_ids_tail[offset])] = [int(pack_counts[offset]), 0]
@@ -1591,12 +1601,21 @@ class DatabaseBuilder:
                     pool_start, pool_stop, pool_card_ids = pool_span
                     pack_counts = count_vector(row[pack_start:pack_stop])
                     pool_counts = count_vector(row[pool_start:pool_stop])
-                    offered_offset = offered_position - pack_start
-                    if offered_offset < 0 or offered_offset >= len(pack_counts) or int(pack_counts[offered_offset]) <= 0:
-                        raise ValueError(
-                            f"Selected card {picked_name!r} not offered for {draft_id} "
-                            f"pack={pack_number} pick={pick_number}"
-                        )
+                    if offered_position is not None:
+                        offered_offset = offered_position - pack_start
+                        if (
+                                offered_offset < 0
+                                or offered_offset >= len(pack_counts)
+                                or int(pack_counts[offered_offset]) <= 0
+                        ):
+                            LOG.warning(
+                                "Source inconsistency: selected card %r not present in offered pack "
+                                "for draft %s pack=%s pick=%s; preserving source values.",
+                                picked_name,
+                                draft_id,
+                                pack_number,
+                                pick_number,
+                            )
                     for offset_raw in np.flatnonzero(pack_counts):
                         offset = int(offset_raw)
                         card_counts[int(pack_card_ids[offset])] = [int(pack_counts[offset]), 0]
@@ -1610,10 +1629,14 @@ class DatabaseBuilder:
                         else:
                             counts[1] = count
                 else:
-                    if source_count(row[offered_position]) <= 0:
-                        raise ValueError(
-                            f"Selected card {picked_name!r} not offered for {draft_id} "
-                            f"pack={pack_number} pick={pick_number}"
+                    if offered_position is not None and source_count(row[offered_position]) <= 0:
+                        LOG.warning(
+                            "Source inconsistency: selected card %r not present in offered pack "
+                            "for draft %s pack=%s pick=%s; preserving source values.",
+                            picked_name,
+                            draft_id,
+                            pack_number,
+                            pick_number,
                         )
                     for position, card_id in pack_fields:
                         count = source_count(row[position])
