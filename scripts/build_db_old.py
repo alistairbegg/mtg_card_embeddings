@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """Build a normalized DuckDB from public 17Lands draft/game/replay data.
 
-For each dataset the builder works in batches of draft IDs. For each batch it first
-streams the draft CSV and loads picks for those drafts, then gathers all game rows for
-those drafts, then scans the replay CSV for those exact games and imports their
-replay-derived hands, turns, states, zones and events. It then moves to the next batch.
+For each dataset the builder scans each large source only once for normalization:
+it establishes first-seen draft order from game_data, imports remaining draft picks in
+one draft_data pass, imports remaining games/builds in one game_data pass, then imports
+replay-derived hands, turns, states, zones and events in one replay_data pass.
+
+The existing next_draft_index checkpoint remains authoritative, so databases created by
+the previous draft-batched builder can resume without rebuilding completed drafts.
+Additional source-phase checkpoints make the single-pass scans resumable after failure.
+Wide draft rows use a small quote-aware metadata-prefix parser followed by NumPy's
+compiled fromstring parser for the ~1,090 numeric pack/pool fields, avoiding per-card
+Python parsing; other wide CSV rows use a C-level split fast path whenever quoting is
+absent. Replay turn IDs are hashed once per active turn and reused across child tables.
 
 The database preserves source truth rather than reconstructing ambiguous chronology.
 The N in user_turn_N / oppo_turn_N is stored as source_turn_index. Every event keeps
@@ -20,19 +28,30 @@ import argparse
 import csv
 import gzip
 import hashlib
+import io
 import json
 import logging
 import re
+import subprocess
+import time
+from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable
 
 import duckdb
 import numpy as np
 import pandas as pd
 
 LOG = logging.getLogger("17lands-db")
+
+S3_BUCKET = "alistairbegg-personal-projects"
+S3_PREFIX = "mtg_card_embeddings/data"
+S3_REGION = "eu-west-2"
+S3_DATABASE_KEY = f"{S3_PREFIX}/17lands.duckdb"
+S3_MANIFEST_KEY = f"{S3_PREFIX}/manifest.json"
+S3_HASH_CHUNK_SIZE = 8 * 1024 * 1024
 GAME_KEY = ("draft_id", "match_number", "game_number")
 TURN_RE = re.compile(r"^(user|oppo)_turn_(\d+)_(.+)$")
 GAME_CARD_PREFIXES = ("opening_hand", "drawn", "tutored", "deck", "sideboard")
@@ -282,6 +301,28 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
     completed BOOLEAN NOT NULL,
     updated_at TIMESTAMP NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS source_ingestion_checkpoints (
+    dataset_id VARCHAR NOT NULL,
+    phase VARCHAR NOT NULL,
+    source_file VARCHAR NOT NULL,
+    source_signature VARCHAR NOT NULL,
+    next_source_row BIGINT NOT NULL,
+    completed BOOLEAN NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (dataset_id, phase)
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_draft_status (
+    dataset_id VARCHAR NOT NULL,
+    draft_index BIGINT NOT NULL,
+    draft_id VARCHAR NOT NULL,
+    expected_games BIGINT NOT NULL,
+    replay_games_processed BIGINT NOT NULL,
+    completed BOOLEAN NOT NULL,
+    PRIMARY KEY (dataset_id, draft_index),
+    UNIQUE (dataset_id, draft_id)
+);
 """
 
 
@@ -315,254 +356,260 @@ def parse_draft_card_columns(columns: Iterable[str]) -> tuple[dict[str, str], di
 
 
 def source_count(value: str) -> int:
-    text = str(value).strip()
-    if text == "" or text.lower() in {"0", "0.0", "nan", "none", "<na>"}:
+    # csv.reader already returns strings. The overwhelming majority of these wide
+    # count columns are exactly "0", "1", or "2"; keep that hot path allocation-free.
+    if value == "" or value == "0" or value == "0.0":
         return 0
-    return int(float(text))
+    if value == "1":
+        return 1
+    if value == "2":
+        return 2
+    if value == "3":
+        return 3
+    try:
+        return int(value)
+    except ValueError:
+        text = value.strip()
+        if not text or text.lower() in {"nan", "none", "<na>"}:
+            return 0
+        return int(float(text))
+
+
+def csv_field_at(record: str, target_index: int) -> str:
+    """Extract a field while avoiding a full parse of a wide record.
+
+    17Lands puts draft_id at/near the front. The common path therefore stays in
+    CPython's C string routines and is effectively independent of record width.
+    A quote-aware parser is used only if a quoted field occurs before the target.
+    """
+    if target_index == 0:
+        head, sep, _tail = record.partition(",")
+        if not sep:
+            return head.rstrip("\r\n")
+        if '"' not in head:
+            return head
+
+    start = 0
+    for field_index in range(target_index + 1):
+        comma = record.find(",", start)
+        end = len(record) if comma < 0 else comma
+        candidate = record[start:end]
+        # If no quote has appeared in the prefix, normal comma positions are safe.
+        if '"' not in record[:end]:
+            if field_index == target_index:
+                return candidate.rstrip("\r\n")
+            start = end + 1
+            continue
+        break
+
+    # Rare fallback for quoted commas before the requested field.
+    return next(csv.reader([record]))[target_index]
+
+
+def parse_csv_record(record: str, expected_columns: int, source_name: str, source_row: int) -> list[str]:
+    # Most 17Lands data rows contain no CSV quoting. str.split is implemented in C
+    # and is substantially faster than csv.reader for ~1,000-column records.
+    if '"' not in record:
+        row = record.rstrip("\r\n").split(",")
+    else:
+        row = next(csv.reader([record]))
+    if len(row) != expected_columns:
+        raise ValueError(
+            f"Malformed {source_name} CSV row {source_row}: {len(row)} fields, "
+            f"expected {expected_columns}"
+        )
+    return row
+
+
+def contiguous_span(fields: list[tuple[int, int]]) -> tuple[int, int, np.ndarray] | None:
+    """Return [start, stop) and aligned card IDs when source positions are contiguous."""
+    if not fields:
+        return None
+    positions = [position for position, _card_id in fields]
+    start = positions[0]
+    stop = start + len(positions)
+    if positions != list(range(start, stop)):
+        return None
+    return start, stop, np.asarray([card_id for _position, card_id in fields], dtype=np.int64)
+
+
+def count_vector(values: list[str]) -> np.ndarray:
+    """Convert a dense run of draft count strings in compiled NumPy code.
+
+    Normal 17Lands draft count fields are integer strings. A tolerant fallback
+    preserves the old parser for unusual blanks/float spellings.
+    """
+    try:
+        return np.asarray(values, dtype=np.int16)
+    except (TypeError, ValueError):
+        return np.fromiter((source_count(value) for value in values), dtype=np.int16, count=len(values))
+
+
+def split_csv_prefix(record: str, field_count: int) -> tuple[list[str], str]:
+    """Parse exactly field_count CSV fields and return the untouched tail.
+
+    This is designed for draft_data where a small metadata prefix is followed by
+    ~1,090 numeric count fields. The common no-quote prefix uses str.split in C;
+    the quote-aware fallback scans only the short metadata prefix, not the tail.
+    """
+    if field_count <= 0:
+        return [], record.rstrip("\r\n")
+
+    parts = record.split(",", field_count)
+    if len(parts) == field_count + 1 and not any('"' in part for part in parts[:field_count]):
+        return parts[:field_count], parts[field_count].rstrip("\r\n")
+
+    fields: list[str] = []
+    chars: list[str] = []
+    in_quotes = False
+    i = 0
+    n = len(record)
+    while i < n and len(fields) < field_count:
+        ch = record[i]
+        if ch == '"':
+            if in_quotes and i + 1 < n and record[i + 1] == '"':
+                chars.append('"')
+                i += 2
+                continue
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        if ch == "," and not in_quotes:
+            fields.append("".join(chars))
+            chars.clear()
+            i += 1
+            continue
+        if ch not in "\r\n":
+            chars.append(ch)
+        i += 1
+
+    if len(fields) != field_count:
+        raise ValueError(f"CSV record ended before {field_count} prefix fields were parsed")
+    return fields, record[i:].rstrip("\r\n")
+
+
+def numeric_csv_tail(tail: str, expected_count: int) -> np.ndarray | None:
+    """Parse a comma-separated numeric tail in NumPy/C, returning int16 counts.
+
+    None means the row used an unusual spelling (for example an empty count) and
+    should take the fully tolerant CSV fallback.
+    """
+    if expected_count == 0:
+        return np.empty(0, dtype=np.int16)
+    try:
+        values = np.fromstring(tail, sep=",", dtype=np.float32)
+    except ValueError:
+        return None
+    if len(values) != expected_count:
+        return None
+    if not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values > np.iinfo(np.int16).max):
+        return None
+    rounded = values.astype(np.int16)
+    if not np.all(values == rounded):
+        return None
+    return rounded
+
+
+def skip_checkpointed_records(
+    records: Iterable[str],
+    count: int,
+    progress_every: int,
+) -> int:
+    """Skip already-committed records without running csv.reader on them."""
+    skipped = 0
+    for _ in range(count):
+        try:
+            next(records)
+        except StopIteration as exc:
+            raise ValueError(
+                f"Source ended while skipping {count:,} checkpointed rows; reached {skipped:,}"
+            ) from exc
+        skipped += 1
+        if progress_every > 0 and skipped % progress_every == 0:
+            LOG.info(
+                "Resume catch-up: %s/%s checkpointed source rows skipped.",
+                f"{skipped:,}",
+                f"{count:,}",
+            )
+    if count:
+        LOG.info("Resume catch-up complete at source row %s.", f"{count:,}")
+    return skipped
 
 
 def upsert_draft_metadata(
     con: duckdb.DuckDBPyConnection,
     rows: list[dict[str, Any]],
 ) -> None:
-    fields = (
-        "expansion",
-        "event_type",
-        "draft_time",
-        "rank",
-        "event_match_wins",
-        "event_match_losses",
-        "user_n_games_bucket",
-        "user_game_win_rate_bucket",
-    )
-    for row in rows:
-        draft_id = row["draft_id"]
-        existing = con.execute(
-            f"SELECT {', '.join(fields)} FROM drafts WHERE draft_id = ?",
-            [draft_id],
-        ).fetchone()
-        if existing is None:
-            con.execute(
-                f"INSERT INTO drafts (draft_id, {', '.join(fields)}) "
-                f"VALUES (?, {', '.join('?' for _ in fields)})",
-                [draft_id, *(row[field] for field in fields)],
-            )
-            continue
-        for stored, field in zip(existing, fields, strict=True):
-            source = row[field]
-            if source is None:
-                continue
-            equal = values_equal((stored,), (source,))
-            if stored is not None and not equal:
-                raise ValueError(
-                    f"Draft metadata changed for {draft_id}: "
-                    f"{field} {stored!r} != {source!r}"
-                )
-            if stored is None:
-                con.execute(
-                    f"UPDATE drafts SET {field} = ? WHERE draft_id = ?",
-                    [source, draft_id],
-                )
-
-
-def clear_partial_draft_picks(
-    con: duckdb.DuckDBPyConnection,
-    draft_ids: set[str],
-) -> None:
-    frame = pd.DataFrame({"draft_id": sorted(draft_ids)})
-    con.register("_target_drafts", frame)
+    if not rows:
+        return
+    frame = pd.DataFrame(rows)
+    con.register("_draft_metadata_chunk", frame)
     try:
+        mismatch = con.execute(
+            """
+            SELECT s.draft_id
+            FROM _draft_metadata_chunk s
+            JOIN drafts d USING (draft_id)
+            WHERE (s.expansion IS NOT NULL AND d.expansion IS NOT NULL
+                   AND d.expansion IS DISTINCT FROM s.expansion)
+               OR (s.event_type IS NOT NULL AND d.event_type IS NOT NULL
+                   AND d.event_type IS DISTINCT FROM s.event_type)
+               OR (s.draft_time IS NOT NULL AND d.draft_time IS NOT NULL
+                   AND d.draft_time IS DISTINCT FROM CAST(s.draft_time AS TIMESTAMP))
+               OR (s.rank IS NOT NULL AND d.rank IS NOT NULL
+                   AND d.rank IS DISTINCT FROM s.rank)
+               OR (s.event_match_wins IS NOT NULL AND d.event_match_wins IS NOT NULL
+                   AND d.event_match_wins IS DISTINCT FROM CAST(s.event_match_wins AS SMALLINT))
+               OR (s.event_match_losses IS NOT NULL AND d.event_match_losses IS NOT NULL
+                   AND d.event_match_losses IS DISTINCT FROM CAST(s.event_match_losses AS SMALLINT))
+               OR (s.user_n_games_bucket IS NOT NULL AND d.user_n_games_bucket IS NOT NULL
+                   AND d.user_n_games_bucket IS DISTINCT FROM CAST(s.user_n_games_bucket AS SMALLINT))
+               OR (s.user_game_win_rate_bucket IS NOT NULL AND d.user_game_win_rate_bucket IS NOT NULL
+                   AND CAST(d.user_game_win_rate_bucket AS REAL)
+                       IS DISTINCT FROM CAST(s.user_game_win_rate_bucket AS REAL))
+            LIMIT 10
+            """
+        ).fetchall()
+        if mismatch:
+            raise ValueError(
+                f"Draft metadata differs from existing database for draft IDs: "
+                f"{[str(row[0]) for row in mismatch]}"
+            )
         con.execute(
-            "DELETE FROM draft_pick_cards WHERE pick_id IN ("
-            "SELECT p.pick_id FROM draft_picks p "
-            "JOIN _target_drafts d USING (draft_id))"
+            """
+            UPDATE drafts AS d
+            SET expansion = coalesce(d.expansion, s.expansion),
+                event_type = coalesce(d.event_type, s.event_type),
+                draft_time = coalesce(d.draft_time, CAST(s.draft_time AS TIMESTAMP)),
+                rank = coalesce(d.rank, s.rank),
+                event_match_wins = coalesce(d.event_match_wins, CAST(s.event_match_wins AS SMALLINT)),
+                event_match_losses = coalesce(d.event_match_losses, CAST(s.event_match_losses AS SMALLINT)),
+                user_n_games_bucket = coalesce(d.user_n_games_bucket, CAST(s.user_n_games_bucket AS SMALLINT)),
+                user_game_win_rate_bucket = coalesce(
+                    d.user_game_win_rate_bucket, CAST(s.user_game_win_rate_bucket AS REAL)
+                )
+            FROM _draft_metadata_chunk AS s
+            WHERE d.draft_id = s.draft_id
+            """
         )
         con.execute(
-            "DELETE FROM draft_picks WHERE draft_id IN "
-            "(SELECT draft_id FROM _target_drafts)"
+            """
+            INSERT INTO drafts (
+                draft_id, expansion, event_type, draft_time, rank, event_match_wins,
+                event_match_losses, user_n_games_bucket, user_game_win_rate_bucket
+            )
+            SELECT
+                s.draft_id, s.expansion, s.event_type, CAST(s.draft_time AS TIMESTAMP), s.rank,
+                CAST(s.event_match_wins AS SMALLINT), CAST(s.event_match_losses AS SMALLINT),
+                CAST(s.user_n_games_bucket AS SMALLINT), CAST(s.user_game_win_rate_bucket AS REAL)
+            FROM _draft_metadata_chunk s
+            LEFT JOIN drafts d USING (draft_id)
+            WHERE d.draft_id IS NULL
+            """
         )
     finally:
-        con.unregister("_target_drafts")
+        con.unregister("_draft_metadata_chunk")
 
-
-def ingest_draft_batch(
-    con: duckdb.DuckDBPyConnection,
-    draft_file: Path,
-    draft_header: list[str],
-    target_draft_ids: set[str],
-    card_name_to_id: dict[str, int],
-) -> None:
-    """Replace draft picks for one outer batch of draft IDs.
-
-    The draft CSV is streamed with csv.reader so the very wide source never becomes
-    a pandas DataFrame. The ingestion checkpoint is deliberately not advanced here:
-    if the process stops before the matching games are committed, rerunning the same
-    outer batch clears and rebuilds only these draft picks.
-    """
-    index = {column: position for position, column in enumerate(draft_header)}
-    missing = DRAFT_REQUIRED_COLUMNS - set(index)
-    if missing:
-        raise ValueError(f"Draft CSV is missing required columns: {sorted(missing)}")
-
-    pack_columns, pool_columns = parse_draft_card_columns(draft_header)
-    if not pack_columns or not pool_columns:
-        raise ValueError("Draft CSV must contain pack_card_* and pool_* columns")
-
-    pack_fields = [
-        (index[column], name, card_name_to_id[name])
-        for column, name in pack_columns.items()
-    ]
-    pool_fields = [
-        (index[column], card_name_to_id[name])
-        for column, name in pool_columns.items()
-    ]
-
-    def value(row: list[str], column: str) -> str | None:
-        position = index.get(column)
-        return None if position is None else row[position]
-
-    # A failed/rerun batch can have draft picks already present even though its game
-    # checkpoint did not advance. Replace just this batch before streaming it again.
-    clear_partial_draft_picks(con, target_draft_ids)
-
-    draft_rows: dict[str, dict[str, Any]] = {}
-    pick_rows: list[dict[str, Any]] = []
-    pick_card_rows: list[dict[str, Any]] = []
-    found_drafts: set[str] = set()
-    seen_pick_ids: set[int] = set()
-    total_picks = 0
-
-    def commit_rows() -> None:
-        nonlocal total_picks
-        if not pick_rows:
-            return
-        con.execute("BEGIN")
-        try:
-            upsert_draft_metadata(con, list(draft_rows.values()))
-            insert_rows(
-                con,
-                "draft_picks",
-                pick_rows,
-                int64=("pick_id", "card_id"),
-                int16=("pack_number", "pick_number"),
-            )
-            insert_rows(
-                con,
-                "draft_pick_cards",
-                pick_card_rows,
-                int64=("pick_id", "card_id"),
-                int16=("pack_count", "pool_count"),
-            )
-            con.execute("COMMIT")
-        except BaseException:
-            con.execute("ROLLBACK")
-            raise
-        total_picks += len(pick_rows)
-        draft_rows.clear()
-        pick_rows.clear()
-        pick_card_rows.clear()
-
-    with open_csv_text(draft_file) as handle:
-        reader = csv.reader(handle)
-        header = next(reader)
-        if header != draft_header:
-            raise ValueError("Draft header changed between startup and scan")
-
-        for row in reader:
-            draft_id = row[index["draft_id"]]
-            if draft_id not in target_draft_ids:
-                continue
-
-            metadata = {
-                "draft_id": draft_id,
-                "expansion": text_or_none(value(row, "expansion")),
-                "event_type": text_or_none(value(row, "event_type")),
-                "draft_time": timestamp_or_none(value(row, "draft_time")),
-                "rank": text_or_none(value(row, "rank")),
-                "event_match_wins": integer_or_none(value(row, "event_match_wins")),
-                "event_match_losses": integer_or_none(value(row, "event_match_losses")),
-                "user_n_games_bucket": integer_or_none(value(row, "user_n_games_bucket")),
-                "user_game_win_rate_bucket": numeric_or_none(value(row, "user_game_win_rate_bucket")),
-            }
-            previous = draft_rows.get(draft_id)
-            if previous is None:
-                draft_rows[draft_id] = metadata
-            else:
-                for field, incoming in metadata.items():
-                    if field == "draft_id" or incoming is None:
-                        continue
-                    stored = previous.get(field)
-                    if stored is None:
-                        previous[field] = incoming
-                    elif not values_equal((stored,), (incoming,)):
-                        raise ValueError(f"Conflicting {field} within draft {draft_id}")
-
-            found_drafts.add(draft_id)
-            pack_number = parse_key_integer(row[index["pack_number"]])
-            pick_number = parse_key_integer(row[index["pick_number"]])
-            picked_name = normalize_card_name(row[index["pick"]])
-            picked_id = card_name_to_id[picked_name]
-            pick_id = make_pick_id(draft_id, pack_number, pick_number)
-            if pick_id in seen_pick_ids:
-                raise ValueError(
-                    f"Duplicate draft pick for {draft_id} pack={pack_number} pick={pick_number}"
-                )
-            seen_pick_ids.add(pick_id)
-
-            card_counts: dict[int, list[int]] = {}
-            picked_offered = False
-            for position, name, card_id in pack_fields:
-                count = source_count(row[position])
-                if count:
-                    card_counts.setdefault(card_id, [0, 0])[0] = count
-                    if name == picked_name:
-                        picked_offered = True
-            if not picked_offered:
-                raise ValueError(
-                    f"Selected card {picked_name!r} not offered for {draft_id} "
-                    f"pack={pack_number} pick={pick_number}"
-                )
-            for position, card_id in pool_fields:
-                count = source_count(row[position])
-                if count:
-                    card_counts.setdefault(card_id, [0, 0])[1] = count
-
-            pick_rows.append({
-                "pick_id": pick_id,
-                "draft_id": draft_id,
-                "pack_number": pack_number,
-                "pick_number": pick_number,
-                "card_id": picked_id,
-                "pick_maindeck_rate": numeric_or_none(value(row, "pick_maindeck_rate")),
-                "pick_sideboard_in_rate": numeric_or_none(value(row, "pick_sideboard_in_rate")),
-            })
-            pick_card_rows.extend(
-                {
-                    "pick_id": pick_id,
-                    "card_id": card_id,
-                    "pack_count": counts[0],
-                    "pool_count": counts[1],
-                }
-                for card_id, counts in card_counts.items()
-            )
-
-            # Keep Python object growth bounded even when a batch contains many picks.
-            if len(pick_rows) >= 500:
-                commit_rows()
-
-    commit_rows()
-
-    missing_drafts = target_draft_ids - found_drafts
-    if missing_drafts:
-        raise ValueError(
-            f"Draft CSV is missing {len(missing_drafts)} game-backed drafts; "
-            f"first: {sorted(missing_drafts)[:10]}"
-        )
-    LOG.info(
-        "Loaded draft data for %d drafts (%d picks).",
-        len(found_drafts),
-        total_picks,
-    )
 
 
 @dataclass(frozen=True)
@@ -599,18 +646,146 @@ class Checkpoint:
     completed: bool
 
 
+@dataclass(frozen=True)
+class SourceCheckpoint:
+    next_source_row: int
+    completed: bool
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(S3_HASH_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+class S3BackupManager:
+    """Periodically upload committed DuckDB snapshots when explicitly enabled.
+
+    Uploads are synchronous and are only attempted after a source chunk has committed.
+    The active DuckDB connection is checkpointed before the file is read, so the uploaded
+    .duckdb object is a self-contained snapshot. No boto3 import, AWS credential lookup,
+    checkpoint-for-upload, checksum, or network call occurs when this manager is absent.
+    """
+
+    def __init__(self, db_path: Path, interval_minutes: float) -> None:
+        if interval_minutes <= 0:
+            raise ValueError("--s3-backup-every-minutes must be positive")
+        self.db_path = db_path
+        self.interval_seconds = interval_minutes * 60.0
+        self.last_upload_monotonic = time.monotonic()
+        self.last_attempt_monotonic = 0.0
+        self.s3 = None
+
+    def _client(self):
+        if self.s3 is None:
+            try:
+                import boto3
+                from botocore.config import Config
+            except ImportError as exc:
+                raise RuntimeError(
+                    "S3 backups require boto3/botocore. Install them or omit "
+                    "--s3-backup-every-minutes."
+                ) from exc
+            session = boto3.Session()
+            self.s3 = session.client(
+                "s3",
+                region_name=S3_REGION,
+                config=Config(signature_version="s3v4"),
+            )
+        return self.s3
+
+    def _manifest(self) -> dict[str, Any]:
+        return {
+            "database": self.db_path.name,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "size_bytes": self.db_path.stat().st_size,
+            "sha256": sha256_file(self.db_path),
+            "git_commit": get_git_commit(),
+        }
+
+    def maybe_upload(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        *,
+        reason: str,
+        force: bool = False,
+    ) -> bool:
+        now = time.monotonic()
+        if not force and now - self.last_upload_monotonic < self.interval_seconds:
+            return False
+
+        # If AWS is temporarily unavailable, avoid retrying on every tiny DB commit.
+        retry_floor = min(self.interval_seconds, 300.0)
+        if not force and self.last_attempt_monotonic and now - self.last_attempt_monotonic < retry_floor:
+            return False
+        self.last_attempt_monotonic = now
+
+        started = time.monotonic()
+        LOG.info(
+            "S3 backup due (%s): checkpointing %s before upload.",
+            reason,
+            self.db_path,
+        )
+        try:
+            con.execute("CHECKPOINT")
+            manifest = self._manifest()
+            s3 = self._client()
+            LOG.info(
+                "S3 backup: uploading %s bytes to s3://%s/%s.",
+                f"{manifest['size_bytes']:,}",
+                S3_BUCKET,
+                S3_DATABASE_KEY,
+            )
+            s3.upload_file(str(self.db_path), S3_BUCKET, S3_DATABASE_KEY)
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=S3_MANIFEST_KEY,
+                Body=json.dumps(manifest, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            LOG.exception(
+                "S3 backup failed; ingestion will continue and retry after a later commit."
+            )
+            return False
+
+        self.last_upload_monotonic = time.monotonic()
+        LOG.info(
+            "S3 backup complete in %.1fs: s3://%s/%s",
+            time.monotonic() - started,
+            S3_BUCKET,
+            S3_DATABASE_KEY,
+        )
+        return True
+
+
 class DatabaseBuilder:
     def __init__(
         self,
         paths: Paths,
         batch_size: int,
         overwrite: bool,
-        replay_progress_every: int,
+        progress_every: int,
+        s3_backup: S3BackupManager | None = None,
     ) -> None:
         self.paths = paths
         self.batch_size = batch_size
         self.overwrite = overwrite
-        self.replay_progress_every = replay_progress_every
+        self.progress_every = progress_every
+        self.s3_backup = s3_backup
 
         self.draft_columns = read_header(paths.draft_file)
         self.game_columns = read_header(paths.game_file)
@@ -655,10 +830,6 @@ class DatabaseBuilder:
         draft_signature = file_signature(self.paths.draft_file, self.draft_columns)
         game_signature = file_signature(self.paths.game_file, self.game_columns)
         replay_signature = file_signature(self.paths.replay_file, self.replay_columns)
-        ordered_draft_ids = collect_game_draft_ids_ordered(
-            self.paths.game_file,
-            self.game_columns,
-        )
 
         con = duckdb.connect(str(self.paths.output))
         try:
@@ -677,79 +848,41 @@ class DatabaseBuilder:
                 self.run_integrity_checks(con)
                 return
 
+            # Preserve the existing draft-oriented checkpoint exactly.  The source
+            # phase checkpoints below are additive and make each large gzip scan
+            # resumable without changing the meaning of next_draft_index.
+            self.build_draft_order(con, game_signature, checkpoint)
+            total_drafts = int(con.execute(
+                "SELECT count(*) FROM ingestion_draft_status WHERE dataset_id = ?",
+                [self.paths.dataset_id],
+            ).fetchone()[0])
+            if checkpoint.next_draft_index > total_drafts:
+                raise ValueError(
+                    f"Checkpoint draft index {checkpoint.next_draft_index} exceeds "
+                    f"the {total_drafts} drafts found in game_data"
+                )
+
             LOG.info(
-                "Resuming %s at draft %d/%d.",
+                "Resuming %s at draft %d/%d. Source files will each be scanned once.",
                 self.paths.dataset_id,
                 checkpoint.next_draft_index,
-                len(ordered_draft_ids),
+                total_drafts,
             )
 
-            next_index = checkpoint.next_draft_index
-            for batch_start, batch_ids, game_batch in iter_game_draft_batches(
-                self.paths.game_file,
-                self.game_columns,
-                self.game_usecols(),
-                ordered_draft_ids,
-                self.batch_size,
-                checkpoint.next_draft_index,
-            ):
-                LOG.info(
-                    "Draft batch %d..%d: loading draft picks for %d drafts.",
-                    batch_start,
-                    batch_start + len(batch_ids) - 1,
-                    len(batch_ids),
-                )
-                ingest_draft_batch(
-                    con,
-                    self.paths.draft_file,
-                    self.draft_columns,
-                    set(batch_ids),
-                    self.reference.card_name_to_id,
-                )
+            self.ingest_drafts_single_pass(con, draft_signature)
+            self.ingest_games_single_pass(con, game_signature)
+            self.ingest_replays_single_pass(con, replay_signature, total_drafts)
 
-                ordered_keys = game_keys(game_batch)
-                replay_batch, scanned = extract_replay_rows(
-                    self.paths.replay_file,
-                    self.replay_columns,
-                    self.replay_usecols(),
-                    ordered_keys,
-                    self.replay_progress_every,
-                )
-                LOG.info(
-                    "Draft batch %d..%d: %d games; replay scan %d rows.",
-                    batch_start,
-                    batch_start + len(batch_ids) - 1,
-                    len(game_batch),
-                    scanned,
-                )
-
-                draft_values = game_batch["draft_id"].astype(str).to_numpy()
-                for offset, draft_id in enumerate(batch_ids):
-                    positions = np.flatnonzero(draft_values == draft_id)
-                    if not len(positions):
-                        raise ValueError(f"No game rows found for expected draft {draft_id}")
-                    draft_games = game_batch.iloc[positions].reset_index(drop=True)
-                    draft_replays = replay_batch.iloc[positions].reset_index(drop=True)
-                    current = Checkpoint(
-                        next_draft_index=batch_start + offset,
-                        committed_drafts=batch_start + offset,
-                        completed=False,
-                    )
-                    self.process_draft(con, draft_id, draft_games, draft_replays, current)
-                    next_index = batch_start + offset + 1
-
-                con.execute("CHECKPOINT")
-
-            final_checkpoint = Checkpoint(
-                next_draft_index=next_index,
-                committed_drafts=next_index,
-                completed=False,
-            )
+            final_checkpoint = Checkpoint(total_drafts, total_drafts, False)
             self.mark_complete(con, final_checkpoint)
             LOG.info("Dataset %s is complete.", self.paths.dataset_id)
             self.run_integrity_checks(con)
         finally:
             con.close()
+
+    def maybe_s3_backup(self, con: duckdb.DuckDBPyConnection, reason: str) -> None:
+        if self.s3_backup is not None:
+            self.s3_backup.maybe_upload(con, reason=reason)
 
     def game_usecols(self) -> list[str]:
         wanted = set(GAME_METADATA_COLUMNS)
@@ -774,6 +907,1002 @@ class DatabaseBuilder:
             for suffix in TOTAL_FIELDS.values():
                 wanted.add(f"{side}_{suffix}")
         return [column for column in self.replay_columns if column in wanted]
+
+    def load_or_create_source_checkpoint(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        phase: str,
+        source_file: Path,
+        source_signature: str,
+    ) -> SourceCheckpoint:
+        row = con.execute(
+            """
+            SELECT source_signature, next_source_row, completed
+            FROM source_ingestion_checkpoints
+            WHERE dataset_id = ? AND phase = ?
+            """,
+            [self.paths.dataset_id, phase],
+        ).fetchone()
+        if row is None:
+            con.execute(
+                """
+                INSERT INTO source_ingestion_checkpoints (
+                    dataset_id, phase, source_file, source_signature,
+                    next_source_row, completed, updated_at
+                ) VALUES (?, ?, ?, ?, 0, FALSE, current_timestamp)
+                """,
+                [self.paths.dataset_id, phase, str(source_file), source_signature],
+            )
+            return SourceCheckpoint(0, False)
+        saved_signature, next_source_row, completed = row
+        if saved_signature != source_signature:
+            raise ValueError(
+                f"Source checkpoint for phase {phase!r} does not match the current file. "
+                "Use the original source files or rebuild with --overwrite."
+            )
+        return SourceCheckpoint(int(next_source_row), bool(completed))
+
+    def build_draft_order(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        game_signature: str,
+        checkpoint: Checkpoint,
+    ) -> None:
+        """Build first-seen draft order/counts with minimal parsing of game_data."""
+        phase = self.load_or_create_source_checkpoint(
+            con, "order", self.paths.game_file, game_signature
+        )
+        if phase.completed:
+            LOG.info("Index scan already complete.")
+            return
+
+        started = time.monotonic()
+        LOG.info(
+            "Index scan: game_data starting at source row %s.",
+            f"{phase.next_source_row:,}",
+        )
+        existing_rows = con.execute(
+            """
+            SELECT draft_id, draft_index
+            FROM ingestion_draft_status
+            WHERE dataset_id = ?
+            ORDER BY draft_index
+            """,
+            [self.paths.dataset_id],
+        ).fetchall()
+        draft_to_index = {str(draft_id): int(draft_index) for draft_id, draft_index in existing_rows}
+        next_index = len(draft_to_index)
+        draft_position = self.game_columns.index("draft_id")
+        pending_new: list[tuple[str, int, str, bool]] = []
+        pending_counts: Counter[str] = Counter()
+        rows_since_commit = 0
+        source_row = phase.next_source_row
+
+        def commit_progress(next_source_row: int, complete: bool = False) -> None:
+            nonlocal pending_new, pending_counts, rows_since_commit
+            con.execute("BEGIN")
+            try:
+                if pending_new:
+                    con.executemany(
+                        """
+                        INSERT INTO ingestion_draft_status (
+                            dataset_id, draft_index, draft_id, expected_games,
+                            replay_games_processed, completed
+                        ) VALUES (?, ?, ?, 0, 0, ?)
+                        """,
+                        pending_new,
+                    )
+                if pending_counts:
+                    con.executemany(
+                        """
+                        UPDATE ingestion_draft_status
+                        SET expected_games = expected_games + ?
+                        WHERE dataset_id = ? AND draft_id = ?
+                        """,
+                        [
+                            (count, self.paths.dataset_id, draft_id)
+                            for draft_id, count in pending_counts.items()
+                        ],
+                    )
+                con.execute(
+                    """
+                    UPDATE source_ingestion_checkpoints
+                    SET next_source_row = ?, completed = ?, source_file = ?,
+                        updated_at = current_timestamp
+                    WHERE dataset_id = ? AND phase = 'order'
+                    """,
+                    [next_source_row, complete, str(self.paths.game_file), self.paths.dataset_id],
+                )
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            self.maybe_s3_backup(con, "index scan checkpoint")
+            pending_new = []
+            pending_counts = Counter()
+            rows_since_commit = 0
+
+        with open_csv_text(self.paths.game_file) as handle:
+            header = next(csv.reader([next(handle)]))
+            if header != self.game_columns:
+                raise ValueError("Game header changed between startup and order scan")
+            records = iter(handle)
+            skip_checkpointed_records(records, phase.next_source_row, self.progress_every)
+            for record in records:
+                source_row += 1
+                draft_id = csv_field_at(record, draft_position)
+                if draft_id not in draft_to_index:
+                    draft_index = next_index
+                    draft_to_index[draft_id] = draft_index
+                    next_index += 1
+                    pending_new.append((
+                        self.paths.dataset_id,
+                        draft_index,
+                        draft_id,
+                        draft_index < checkpoint.next_draft_index,
+                    ))
+                pending_counts[draft_id] += 1
+                rows_since_commit += 1
+                if rows_since_commit >= 100_000:
+                    commit_progress(source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    LOG.info(
+                        "Index scan: %s game rows read; %s drafts found.",
+                        f"{source_row:,}",
+                        f"{len(draft_to_index):,}",
+                    )
+
+        commit_progress(source_row, complete=True)
+        LOG.info(
+            "Index scan complete: %s game rows; %s drafts; %.1fs.",
+            f"{source_row:,}",
+            f"{len(draft_to_index):,}",
+            time.monotonic() - started,
+        )
+
+    def incomplete_draft_ids(self, con: duckdb.DuckDBPyConnection) -> set[str]:
+        return {
+            str(draft_id)
+            for (draft_id,) in con.execute(
+                """
+                SELECT draft_id
+                FROM ingestion_draft_status
+                WHERE dataset_id = ? AND completed = FALSE
+                """,
+                [self.paths.dataset_id],
+            ).fetchall()
+        }
+
+    def ingest_drafts_single_pass(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        draft_signature: str,
+    ) -> None:
+        assert self.reference is not None
+        phase = self.load_or_create_source_checkpoint(
+            con, "draft", self.paths.draft_file, draft_signature
+        )
+        if phase.completed:
+            LOG.info("Phase 1/3 draft scan already complete.")
+            return
+
+        started = time.monotonic()
+        LOG.info(
+            "Phase 1/3 draft scan: starting at source row %s.",
+            f"{phase.next_source_row:,}",
+        )
+        target_draft_ids = self.incomplete_draft_ids(con)
+        if not target_draft_ids:
+            con.execute(
+                "UPDATE source_ingestion_checkpoints SET completed = TRUE, updated_at = current_timestamp "
+                "WHERE dataset_id = ? AND phase = 'draft'",
+                [self.paths.dataset_id],
+            )
+            return
+
+        index = {column: position for position, column in enumerate(self.draft_columns)}
+        draft_position = index["draft_id"]
+        pack_fields = [
+            (index[column], self.reference.card_name_to_id[name])
+            for column, name in self.draft_pack_columns.items()
+        ]
+        pool_fields = [
+            (index[column], self.reference.card_name_to_id[name])
+            for column, name in self.draft_pool_columns.items()
+        ]
+        pack_span = contiguous_span(pack_fields)
+        pool_span = contiguous_span(pool_fields)
+        pack_position_by_card_id = {card_id: position for position, card_id in pack_fields}
+
+        # The 17Lands draft export has a compact metadata prefix followed by all
+        # pack_card_* and pool_* count columns. If that invariant holds, parse the
+        # entire numeric tail with np.fromstring instead of constructing ~1,090
+        # Python strings and visiting each field in Python.
+        card_positions = sorted(position for position, _card_id in (*pack_fields, *pool_fields))
+        draft_tail_start: int | None = None
+        draft_tail_count = 0
+        if card_positions:
+            candidate_start = card_positions[0]
+            if (
+                card_positions == list(range(candidate_start, len(self.draft_columns)))
+                and len(card_positions) == len(self.draft_columns) - candidate_start
+            ):
+                draft_tail_start = candidate_start
+                draft_tail_count = len(card_positions)
+
+        if draft_tail_start is not None:
+            LOG.info(
+                "Draft scan turbo path: %s metadata fields + %s numeric count fields.",
+                f"{draft_tail_start:,}", f"{draft_tail_count:,}",
+            )
+        elif pack_span is not None and pool_span is not None:
+            LOG.info(
+                "Draft scan vectorization: pack=%s contiguous columns; pool=%s contiguous columns.",
+                f"{len(pack_fields):,}", f"{len(pool_fields):,}",
+            )
+        else:
+            LOG.warning("Draft card columns are not contiguous; using slower sparse fallback.")
+
+        pack_offsets_from_tail = None
+        pool_offsets_from_tail = None
+        pack_card_ids_tail = None
+        pool_card_ids_tail = None
+        if draft_tail_start is not None:
+            pack_offsets_from_tail = np.asarray(
+                [position - draft_tail_start for position, _card_id in pack_fields], dtype=np.int32
+            )
+            pool_offsets_from_tail = np.asarray(
+                [position - draft_tail_start for position, _card_id in pool_fields], dtype=np.int32
+            )
+            pack_card_ids_tail = np.asarray([card_id for _position, card_id in pack_fields], dtype=np.int64)
+            pool_card_ids_tail = np.asarray([card_id for _position, card_id in pool_fields], dtype=np.int64)
+
+        metadata_columns = (
+            "expansion", "event_type", "draft_time", "rank", "event_match_wins",
+            "event_match_losses", "user_n_games_bucket", "user_game_win_rate_bucket",
+        )
+        metadata_positions = {column: index.get(column) for column in metadata_columns}
+        seen_metadata_raw: dict[str, tuple[str | None, ...]] = {}
+
+        draft_rows: dict[str, dict[str, Any]] = {}
+        pick_rows: list[tuple[int, str, int, int, int, float | None, float | None]] = []
+        pick_card_rows: list[tuple[int, int, int, int]] = []
+        source_row = phase.next_source_row
+        raw_since_commit = 0
+        total_picks = 0
+        commit_pick_limit = max(10_000, self.batch_size * 10)
+
+        def commit_progress(next_source_row: int, complete: bool = False) -> None:
+            nonlocal total_picks, raw_since_commit
+            if not pick_rows and not complete and raw_since_commit < 100_000:
+                return
+            con.execute("BEGIN")
+            try:
+                if draft_rows:
+                    upsert_draft_metadata(con, list(draft_rows.values()))
+                if pick_rows:
+                    insert_or_validate_draft_rows(con, pick_rows, pick_card_rows)
+                con.execute(
+                    """
+                    UPDATE source_ingestion_checkpoints
+                    SET next_source_row = ?, completed = ?, source_file = ?,
+                        updated_at = current_timestamp
+                    WHERE dataset_id = ? AND phase = 'draft'
+                    """,
+                    [next_source_row, complete, str(self.paths.draft_file), self.paths.dataset_id],
+                )
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            self.maybe_s3_backup(con, "draft scan checkpoint")
+            total_picks += len(pick_rows)
+            draft_rows.clear()
+            pick_rows.clear()
+            pick_card_rows.clear()
+            raw_since_commit = 0
+
+        with open_csv_text(self.paths.draft_file) as handle:
+            header = next(csv.reader([next(handle)]))
+            if header != self.draft_columns:
+                raise ValueError("Draft header changed between startup and source scan")
+            records = iter(handle)
+            skip_checkpointed_records(records, phase.next_source_row, self.progress_every)
+            LOG.info("Draft scan: processing new source rows.")
+            for record in records:
+                source_row += 1
+                raw_since_commit += 1
+                draft_id = csv_field_at(record, draft_position)
+                if draft_id not in target_draft_ids:
+                    if raw_since_commit >= 100_000:
+                        commit_progress(source_row)
+                    continue
+
+                tail_counts: np.ndarray | None = None
+                if draft_tail_start is not None:
+                    prefix, numeric_tail = split_csv_prefix(record, draft_tail_start)
+                    tail_counts = numeric_csv_tail(numeric_tail, draft_tail_count)
+                    if tail_counts is not None:
+                        # Prefix positions are identical to source positions because the
+                        # numeric tail starts exactly at draft_tail_start.
+                        row = prefix
+                    else:
+                        row = parse_csv_record(record, len(self.draft_columns), "draft", source_row)
+                else:
+                    row = parse_csv_record(record, len(self.draft_columns), "draft", source_row)
+
+                def draft_value(position: int | None) -> str | None:
+                    if position is None:
+                        return None
+                    if position < len(row):
+                        return row[position]
+                    # This only occurs on the tolerant full-row fallback.
+                    return row[position]
+
+                metadata_raw = tuple(
+                    draft_value(position)
+                    for position in metadata_positions.values()
+                )
+                previous_raw = seen_metadata_raw.get(draft_id)
+                if previous_raw is None:
+                    seen_metadata_raw[draft_id] = metadata_raw
+                    draft_rows[draft_id] = {
+                        "draft_id": draft_id,
+                        "expansion": text_or_none(metadata_raw[0]),
+                        "event_type": text_or_none(metadata_raw[1]),
+                        "draft_time": timestamp_or_none(metadata_raw[2]),
+                        "rank": text_or_none(metadata_raw[3]),
+                        "event_match_wins": integer_or_none(metadata_raw[4]),
+                        "event_match_losses": integer_or_none(metadata_raw[5]),
+                        "user_n_games_bucket": integer_or_none(metadata_raw[6]),
+                        "user_game_win_rate_bucket": numeric_or_none(metadata_raw[7]),
+                    }
+                elif metadata_raw != previous_raw:
+                    parsed = (
+                        text_or_none(metadata_raw[0]), text_or_none(metadata_raw[1]),
+                        timestamp_or_none(metadata_raw[2]), text_or_none(metadata_raw[3]),
+                        integer_or_none(metadata_raw[4]), integer_or_none(metadata_raw[5]),
+                        integer_or_none(metadata_raw[6]), numeric_or_none(metadata_raw[7]),
+                    )
+                    prior = (
+                        text_or_none(previous_raw[0]), text_or_none(previous_raw[1]),
+                        timestamp_or_none(previous_raw[2]), text_or_none(previous_raw[3]),
+                        integer_or_none(previous_raw[4]), integer_or_none(previous_raw[5]),
+                        integer_or_none(previous_raw[6]), numeric_or_none(previous_raw[7]),
+                    )
+                    if not values_equal(prior, parsed):
+                        raise ValueError(f"Conflicting draft metadata within draft {draft_id}")
+
+                pack_number = parse_key_integer(draft_value(index["pack_number"]))
+                pick_number = parse_key_integer(draft_value(index["pick_number"]))
+                picked_name = normalize_card_name(draft_value(index["pick"]))
+                picked_id = self.reference.card_name_to_id[picked_name]
+                pick_id = make_pick_id(draft_id, pack_number, pick_number)
+
+                offered_position = pack_position_by_card_id.get(picked_id)
+                if offered_position is None:
+                    raise ValueError(
+                        f"Selected card {picked_name!r} has no offered-pack column for {draft_id}"
+                    )
+
+                card_counts: dict[int, list[int]] = {}
+                if tail_counts is not None:
+                    assert draft_tail_start is not None
+                    assert pack_offsets_from_tail is not None and pool_offsets_from_tail is not None
+                    assert pack_card_ids_tail is not None and pool_card_ids_tail is not None
+                    pack_counts = tail_counts[pack_offsets_from_tail]
+                    pool_counts = tail_counts[pool_offsets_from_tail]
+                    offered_offset = offered_position - draft_tail_start
+                    if offered_offset < 0 or offered_offset >= len(tail_counts) or int(tail_counts[offered_offset]) <= 0:
+                        raise ValueError(
+                            f"Selected card {picked_name!r} not offered for {draft_id} "
+                            f"pack={pack_number} pick={pick_number}"
+                        )
+                    for offset_raw in np.flatnonzero(pack_counts):
+                        offset = int(offset_raw)
+                        card_counts[int(pack_card_ids_tail[offset])] = [int(pack_counts[offset]), 0]
+                    for offset_raw in np.flatnonzero(pool_counts):
+                        offset = int(offset_raw)
+                        card_id = int(pool_card_ids_tail[offset])
+                        count = int(pool_counts[offset])
+                        counts = card_counts.get(card_id)
+                        if counts is None:
+                            card_counts[card_id] = [0, count]
+                        else:
+                            counts[1] = count
+                elif len(row) == len(self.draft_columns) and pack_span is not None and pool_span is not None:
+                    pack_start, pack_stop, pack_card_ids = pack_span
+                    pool_start, pool_stop, pool_card_ids = pool_span
+                    pack_counts = count_vector(row[pack_start:pack_stop])
+                    pool_counts = count_vector(row[pool_start:pool_stop])
+                    offered_offset = offered_position - pack_start
+                    if offered_offset < 0 or offered_offset >= len(pack_counts) or int(pack_counts[offered_offset]) <= 0:
+                        raise ValueError(
+                            f"Selected card {picked_name!r} not offered for {draft_id} "
+                            f"pack={pack_number} pick={pick_number}"
+                        )
+                    for offset_raw in np.flatnonzero(pack_counts):
+                        offset = int(offset_raw)
+                        card_counts[int(pack_card_ids[offset])] = [int(pack_counts[offset]), 0]
+                    for offset_raw in np.flatnonzero(pool_counts):
+                        offset = int(offset_raw)
+                        card_id = int(pool_card_ids[offset])
+                        count = int(pool_counts[offset])
+                        counts = card_counts.get(card_id)
+                        if counts is None:
+                            card_counts[card_id] = [0, count]
+                        else:
+                            counts[1] = count
+                else:
+                    if source_count(row[offered_position]) <= 0:
+                        raise ValueError(
+                            f"Selected card {picked_name!r} not offered for {draft_id} "
+                            f"pack={pack_number} pick={pick_number}"
+                        )
+                    for position, card_id in pack_fields:
+                        count = source_count(row[position])
+                        if count:
+                            card_counts[card_id] = [count, 0]
+                    for position, card_id in pool_fields:
+                        count = source_count(row[position])
+                        if count:
+                            counts = card_counts.get(card_id)
+                            if counts is None:
+                                card_counts[card_id] = [0, count]
+                            else:
+                                counts[1] = count
+
+                pick_rows.append((
+                    pick_id,
+                    draft_id,
+                    pack_number,
+                    pick_number,
+                    picked_id,
+                    numeric_or_none(draft_value(index["pick_maindeck_rate"]))
+                    if "pick_maindeck_rate" in index else None,
+                    numeric_or_none(draft_value(index["pick_sideboard_in_rate"]))
+                    if "pick_sideboard_in_rate" in index else None,
+                ))
+                pick_card_rows.extend(
+                    (pick_id, card_id, counts[0], counts[1])
+                    for card_id, counts in card_counts.items()
+                )
+
+                if len(pick_rows) >= commit_pick_limit:
+                    commit_progress(source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    LOG.info(
+                        "Draft scan: %s rows read; %s relevant picks processed.",
+                        f"{source_row:,}",
+                        f"{total_picks + len(pick_rows):,}",
+                    )
+
+        commit_progress(source_row, complete=True)
+        missing = int(con.execute(
+            """
+            SELECT count(*)
+            FROM ingestion_draft_status s
+            LEFT JOIN draft_picks p ON p.draft_id = s.draft_id
+            WHERE s.dataset_id = ? AND s.completed = FALSE AND p.draft_id IS NULL
+            """,
+            [self.paths.dataset_id],
+        ).fetchone()[0])
+        if missing:
+            raise ValueError(f"Draft source completed but {missing} remaining drafts have no picks")
+        con.execute("CHECKPOINT")
+        LOG.info(
+            "Phase 1/3 draft scan complete: %s rows; %s relevant picks; %.1fs.",
+            f"{source_row:,}",
+            f"{total_picks:,}",
+            time.monotonic() - started,
+        )
+
+    def build_game_player_rows_without_replay(
+        self,
+        game_batch: pd.DataFrame,
+        game_ids: list[int],
+    ) -> list[dict[str, Any]]:
+        metadata = [
+            column for column in (
+                "rank", "main_colors", "splash_colors", "num_mulligans",
+                "opp_rank", "opp_colors", "opp_num_mulligans",
+            )
+            if column in game_batch.columns
+        ]
+        records = game_batch[metadata].to_dict("records")
+        rows: list[dict[str, Any]] = []
+        for position, game in enumerate(records):
+            game_id = game_ids[position]
+            rows.append({
+                "game_id": game_id, "is_user": True,
+                "rank": text_or_none(game.get("rank")),
+                "main_colors": text_or_none(game.get("main_colors")),
+                "splash_colors": text_or_none(game.get("splash_colors")),
+                "observed_colors": None,
+                "num_mulligans": integer_or_none(game.get("num_mulligans")),
+                "n_games_bucket": None, "game_win_rate_bucket": None,
+            })
+            rows.append({
+                "game_id": game_id, "is_user": False,
+                "rank": text_or_none(game.get("opp_rank")),
+                "main_colors": None, "splash_colors": None,
+                "observed_colors": text_or_none(game.get("opp_colors")),
+                "num_mulligans": integer_or_none(game.get("opp_num_mulligans")),
+                "n_games_bucket": None, "game_win_rate_bucket": None,
+            })
+        return rows
+
+    def ingest_games_single_pass(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        game_signature: str,
+    ) -> None:
+        assert self.reference is not None
+        phase = self.load_or_create_source_checkpoint(
+            con, "game", self.paths.game_file, game_signature
+        )
+        if phase.completed:
+            LOG.info("Phase 2/3 game scan already complete.")
+            return
+
+        started = time.monotonic()
+        LOG.info(
+            "Phase 2/3 game scan: starting at source row %s.",
+            f"{phase.next_source_row:,}",
+        )
+        target_draft_ids = self.incomplete_draft_ids(con)
+        wanted_columns = self.game_usecols()
+        index = {column: position for position, column in enumerate(self.game_columns)}
+        wanted_indices = [index[column] for column in wanted_columns]
+        draft_position = index["draft_id"]
+        rows: list[list[str]] = []
+        source_row = phase.next_source_row
+        raw_since_commit = 0
+        total_games = 0
+        chunk_limit = max(5_000, self.batch_size * 5)
+
+        def commit_progress(next_source_row: int, complete: bool = False) -> None:
+            nonlocal total_games, raw_since_commit
+            if not rows and not complete and raw_since_commit < 100_000:
+                return
+            game_batch = pd.DataFrame(rows, columns=wanted_columns) if rows else None
+            con.execute("BEGIN")
+            try:
+                if game_batch is not None and len(game_batch):
+                    game_ids = make_game_ids(game_batch)
+                    if len(set(game_ids)) != len(game_ids):
+                        raise ValueError("Duplicate natural game key inside game source chunk")
+                    draft_rows = self.build_draft_rows(game_batch)
+                    build_ids, build_compositions = self.build_deck_compositions(game_batch)
+                    game_rows = self.build_game_rows(game_batch, game_ids, build_ids)
+                    player_rows = self.build_game_player_rows_without_replay(game_batch, game_ids)
+                    game_stat_rows = self.build_game_card_stats(game_batch, game_ids)
+
+                    self.ensure_drafts(con, draft_rows)
+                    self.ensure_deck_builds(con, build_compositions)
+                    insert_rows(
+                        con, "games", game_rows,
+                        int64=("game_id", "build_id"),
+                        int16=("match_number", "game_number", "source_num_turns"),
+                        boolean=("user_on_play", "user_won"),
+                    )
+                    insert_rows(
+                        con, "game_players", player_rows,
+                        int64=("game_id",),
+                        int16=("num_mulligans", "n_games_bucket"),
+                        boolean=("is_user",),
+                    )
+                    insert_rows(
+                        con, "game_card_stats", game_stat_rows,
+                        int64=("game_id", "card_id"),
+                        int16=("opening_hand_count", "drawn_count", "tutored_count"),
+                    )
+
+                con.execute(
+                    """
+                    UPDATE source_ingestion_checkpoints
+                    SET next_source_row = ?, completed = ?, source_file = ?,
+                        updated_at = current_timestamp
+                    WHERE dataset_id = ? AND phase = 'game'
+                    """,
+                    [next_source_row, complete, str(self.paths.game_file), self.paths.dataset_id],
+                )
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            self.maybe_s3_backup(con, "game scan checkpoint")
+            total_games += len(rows)
+            rows.clear()
+            raw_since_commit = 0
+
+        with open_csv_text(self.paths.game_file) as handle:
+            header = next(csv.reader([next(handle)]))
+            if header != self.game_columns:
+                raise ValueError("Game header changed between startup and source scan")
+            records = iter(handle)
+            skip_checkpointed_records(records, phase.next_source_row, self.progress_every)
+            LOG.info("Game scan: processing new source rows.")
+            for record in records:
+                source_row += 1
+                raw_since_commit += 1
+                draft_id = csv_field_at(record, draft_position)
+                if draft_id in target_draft_ids:
+                    row = parse_csv_record(record, len(self.game_columns), "game", source_row)
+                    rows.append([row[position] for position in wanted_indices])
+                if len(rows) >= chunk_limit or raw_since_commit >= 100_000:
+                    commit_progress(source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    LOG.info(
+                        "Game scan: %s rows read; %s relevant games processed.",
+                        f"{source_row:,}",
+                        f"{total_games + len(rows):,}",
+                    )
+
+        commit_progress(source_row, complete=True)
+        mismatches = con.execute(
+            """
+            SELECT s.draft_id, s.expected_games, count(g.game_id) AS actual_games
+            FROM ingestion_draft_status s
+            LEFT JOIN games g ON g.draft_id = s.draft_id
+            WHERE s.dataset_id = ? AND s.completed = FALSE
+            GROUP BY s.draft_id, s.expected_games
+            HAVING count(g.game_id) <> s.expected_games
+            LIMIT 10
+            """,
+            [self.paths.dataset_id],
+        ).fetchall()
+        if mismatches:
+            raise ValueError(f"Game source counts do not match draft index: {mismatches}")
+        con.execute("CHECKPOINT")
+        LOG.info(
+            "Phase 2/3 game scan complete: %s rows; %s relevant games; %.1fs.",
+            f"{source_row:,}",
+            f"{total_games:,}",
+            time.monotonic() - started,
+        )
+
+    def validate_replay_chunk_against_database(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        replay_batch: pd.DataFrame,
+        game_ids: list[int],
+    ) -> None:
+        id_frame = pd.DataFrame({"game_id": pd.array(game_ids, dtype="Int64")})
+        con.register("_replay_validation_ids", id_frame)
+        try:
+            rows = con.execute(
+                """
+                SELECT g.game_id, g.user_on_play, g.user_won, g.source_num_turns,
+                       u.num_mulligans, o.num_mulligans
+                FROM _replay_validation_ids r
+                LEFT JOIN games g ON g.game_id = r.game_id
+                LEFT JOIN game_players u ON u.game_id = g.game_id AND u.is_user = TRUE
+                LEFT JOIN game_players o ON o.game_id = g.game_id AND o.is_user = FALSE
+                """
+            ).fetchall()
+        finally:
+            con.unregister("_replay_validation_ids")
+
+        expected = {
+            int(game_id): (on_play, won, num_turns, user_mulls, opp_mulls)
+            for game_id, on_play, won, num_turns, user_mulls, opp_mulls in rows
+            if game_id is not None
+        }
+        arrays = {
+            field: replay_batch[field].to_numpy(copy=False)
+            for field in PAIR_CHECK_FIELDS
+            if field in replay_batch.columns
+        }
+        for position, game_id in enumerate(game_ids):
+            if game_id not in expected:
+                raise ValueError(f"Replay row has no staged game row: game_id={game_id}")
+            on_play, won, num_turns, user_mulls, opp_mulls = expected[game_id]
+            checks = (
+                ("on_play", parse_bool(arrays["on_play"][position]) if "on_play" in arrays else None, on_play),
+                ("won", parse_bool(arrays["won"][position]) if "won" in arrays else None, won),
+                ("num_turns", integer_or_none(arrays["num_turns"][position]) if "num_turns" in arrays else None, num_turns),
+                ("num_mulligans", integer_or_none(arrays["num_mulligans"][position]) if "num_mulligans" in arrays else None, user_mulls),
+                ("opp_num_mulligans", integer_or_none(arrays["opp_num_mulligans"][position]) if "opp_num_mulligans" in arrays else None, opp_mulls),
+            )
+            for field, source, stored in checks:
+                if field not in arrays:
+                    continue
+                if source != stored:
+                    raise ValueError(
+                        f"Game/replay mismatch for {field} in game {game_id}: "
+                        f"{stored!r} != {source!r}"
+                    )
+
+    def update_replay_user_metrics(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        replay_batch: pd.DataFrame,
+        game_ids: list[int],
+    ) -> None:
+        rows = [
+            {
+                "game_id": game_ids[position],
+                "n_games_bucket": integer_or_none(record.get("user_n_games_bucket")),
+                "game_win_rate_bucket": numeric_or_none(record.get("user_game_win_rate_bucket")),
+            }
+            for position, record in enumerate(
+                replay_batch[[
+                    column for column in ("user_n_games_bucket", "user_game_win_rate_bucket")
+                    if column in replay_batch.columns
+                ]].to_dict("records")
+            )
+        ]
+        if not rows:
+            return
+        frame = rows_to_frame(rows, int64=("game_id",), int16=("n_games_bucket",))
+        con.register("_replay_user_metrics", frame)
+        try:
+            con.execute(
+                """
+                UPDATE game_players AS gp
+                SET n_games_bucket = m.n_games_bucket,
+                    game_win_rate_bucket = m.game_win_rate_bucket
+                FROM _replay_user_metrics AS m
+                WHERE gp.game_id = m.game_id AND gp.is_user = TRUE
+                """
+            )
+        finally:
+            con.unregister("_replay_user_metrics")
+
+    def advance_main_checkpoint_from_status(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        total_drafts: int,
+    ) -> int:
+        first_incomplete = con.execute(
+            """
+            SELECT min(draft_index)
+            FROM ingestion_draft_status
+            WHERE dataset_id = ? AND completed = FALSE
+            """,
+            [self.paths.dataset_id],
+        ).fetchone()[0]
+        next_index = total_drafts if first_incomplete is None else int(first_incomplete)
+        con.execute(
+            """
+            UPDATE ingestion_checkpoints
+            SET next_draft_index = ?, committed_drafts = ?, updated_at = current_timestamp
+            WHERE dataset_id = ?
+            """,
+            [next_index, next_index, self.paths.dataset_id],
+        )
+        return next_index
+
+    def ingest_replays_single_pass(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        replay_signature: str,
+        total_drafts: int,
+    ) -> None:
+        assert self.reference is not None
+        phase = self.load_or_create_source_checkpoint(
+            con, "replay", self.paths.replay_file, replay_signature
+        )
+        if phase.completed:
+            LOG.info("Phase 3/3 replay scan already complete.")
+            return
+
+        started = time.monotonic()
+        status_rows = con.execute(
+            """
+            SELECT draft_index, draft_id, expected_games, replay_games_processed, completed
+            FROM ingestion_draft_status
+            WHERE dataset_id = ?
+            ORDER BY draft_index
+            """,
+            [self.paths.dataset_id],
+        ).fetchall()
+        status_by_id = {
+            str(draft_id): [int(index), int(expected), int(processed), bool(completed)]
+            for index, draft_id, expected, processed, completed in status_rows
+        }
+        completed_flags = [False] * total_drafts
+        for index, _draft_id, _expected, _processed, completed in status_rows:
+            completed_flags[int(index)] = bool(completed)
+        current_checkpoint = 0
+        while current_checkpoint < total_drafts and completed_flags[current_checkpoint]:
+            current_checkpoint += 1
+        last_checkpoint_logged = current_checkpoint
+
+        LOG.info(
+            "Phase 3/3 replay scan: starting at source row %s; drafts complete %s/%s (%.1f%%).",
+            f"{phase.next_source_row:,}",
+            f"{current_checkpoint:,}",
+            f"{total_drafts:,}",
+            100.0 * current_checkpoint / total_drafts if total_drafts else 100.0,
+        )
+
+        target_draft_ids = {draft_id for draft_id, values in status_by_id.items() if not values[3]}
+        wanted_columns = self.replay_usecols()
+        index = {column: position for position, column in enumerate(self.replay_columns)}
+        missing_columns = [column for column in wanted_columns if column not in index]
+        if missing_columns:
+            raise ValueError(f"Replay CSV missing requested columns: {missing_columns[:20]}")
+        wanted_indices = [index[column] for column in wanted_columns]
+        draft_position = index["draft_id"]
+        rows: list[list[str]] = []
+        source_row = phase.next_source_row
+        raw_since_commit = 0
+        total_replays = 0
+        chunk_limit = max(1_000, self.batch_size)
+
+        def commit_progress(next_source_row: int, complete: bool = False) -> None:
+            nonlocal total_replays, raw_since_commit, current_checkpoint, last_checkpoint_logged
+            if not rows and not complete and raw_since_commit < 100_000:
+                return
+            replay_batch = pd.DataFrame(rows, columns=wanted_columns) if rows else None
+            touched_status: dict[str, tuple[int, int, bool]] = {}
+            con.execute("BEGIN")
+            try:
+                if replay_batch is not None and len(replay_batch):
+                    game_ids = make_game_ids(replay_batch)
+                    if len(set(game_ids)) != len(game_ids):
+                        raise ValueError("Duplicate natural game key inside replay source chunk")
+                    self.validate_replay_chunk_against_database(con, replay_batch, game_ids)
+
+                    positions_by_column = self.turn_meaningful_positions(replay_batch)
+                    active_turns = self.find_turns(replay_batch, game_ids, positions_by_column)
+                    turn_id_map = self.make_turn_id_map(active_turns)
+                    turn_rows = self.build_turn_rows(active_turns, turn_id_map)
+                    event_rows = self.build_event_rows(
+                        replay_batch, game_ids, positions_by_column, turn_id_map
+                    )
+                    hand_rows, hand_card_rows = self.build_candidate_hand_rows(replay_batch, game_ids)
+                    state_rows, zone_rows = self.build_turn_state_and_zones(
+                        replay_batch, game_ids, active_turns, turn_id_map
+                    )
+                    total_rows = self.build_total_rows(replay_batch, game_ids)
+                    validate_batch_rows(
+                        game_ids, turn_rows, event_rows, hand_rows, hand_card_rows,
+                        state_rows, zone_rows,
+                    )
+
+                    insert_rows(
+                        con, "turns", turn_rows, int64=("turn_id", "game_id"),
+                        int16=("source_turn_index",), boolean=("is_user_turn",),
+                    )
+                    insert_rows(
+                        con, "candidate_hands", hand_rows, int64=("hand_id", "game_id"),
+                        int16=("attempt_number",), boolean=("is_final_candidate",),
+                    )
+                    insert_rows(
+                        con, "candidate_hand_cards", hand_card_rows,
+                        int64=("hand_id", "source_arena_card_id", "card_id"),
+                        int16=("slot_number",),
+                    )
+                    insert_rows(
+                        con, "events", event_rows,
+                        int64=(
+                            "event_id", "game_id", "source_turn_id", "actual_turn_id",
+                            "source_arena_card_id", "card_id", "source_ability_id", "ability_id",
+                        ),
+                        int16=("source_ordinal",), boolean=("actor_is_user", "affected_is_user"),
+                    )
+                    insert_rows(
+                        con, "turn_player_state", state_rows, int64=("turn_id",),
+                        int16=("hand_size",), boolean=("player_is_user",),
+                    )
+                    insert_rows(
+                        con, "turn_zone_cards", zone_rows,
+                        int64=("turn_id", "source_arena_card_id", "card_id"),
+                        int16=("quantity",), boolean=("owner_is_user",),
+                    )
+                    insert_rows(
+                        con, "game_player_totals", total_rows, int64=("game_id",),
+                        int16=tuple(field for field in TOTAL_FIELDS if field != "mana_spent"),
+                        boolean=("is_user",),
+                    )
+                    self.update_replay_user_metrics(con, replay_batch, game_ids)
+
+                    counts = Counter(replay_batch["draft_id"].astype(str))
+                    for draft_id, count in counts.items():
+                        values = status_by_id[draft_id]
+                        values[2] += int(count)
+                        if values[2] > values[1]:
+                            raise ValueError(
+                                f"Replay source has more games than game_data for {draft_id}: "
+                                f"{values[2]} > {values[1]}"
+                            )
+                        values[3] = values[2] == values[1]
+                        completed_flags[values[0]] = values[3]
+                        touched_status[draft_id] = (values[2], values[1], values[3])
+
+                    if touched_status:
+                        con.executemany(
+                            """
+                            UPDATE ingestion_draft_status
+                            SET replay_games_processed = ?, completed = ?
+                            WHERE dataset_id = ? AND draft_id = ?
+                            """,
+                            [
+                                (processed, completed, self.paths.dataset_id, draft_id)
+                                for draft_id, (processed, _expected, completed) in touched_status.items()
+                            ],
+                        )
+                    while current_checkpoint < total_drafts and completed_flags[current_checkpoint]:
+                        current_checkpoint += 1
+                    con.execute(
+                        """
+                        UPDATE ingestion_checkpoints
+                        SET next_draft_index = ?, committed_drafts = ?, updated_at = current_timestamp
+                        WHERE dataset_id = ?
+                        """,
+                        [current_checkpoint, current_checkpoint, self.paths.dataset_id],
+                    )
+
+                con.execute(
+                    """
+                    UPDATE source_ingestion_checkpoints
+                    SET next_source_row = ?, completed = ?, source_file = ?,
+                        updated_at = current_timestamp
+                    WHERE dataset_id = ? AND phase = 'replay'
+                    """,
+                    [next_source_row, complete, str(self.paths.replay_file), self.paths.dataset_id],
+                )
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            self.maybe_s3_backup(con, "replay scan checkpoint")
+
+            total_replays += len(rows)
+            rows.clear()
+            raw_since_commit = 0
+            if current_checkpoint - last_checkpoint_logged >= 500 or complete:
+                LOG.info(
+                    "Checkpoint: %s/%s drafts complete (%.1f%%).",
+                    f"{current_checkpoint:,}",
+                    f"{total_drafts:,}",
+                    100.0 * current_checkpoint / total_drafts if total_drafts else 100.0,
+                )
+                last_checkpoint_logged = current_checkpoint
+
+        with open_csv_text(self.paths.replay_file) as handle:
+            header = next(csv.reader([next(handle)]))
+            if header != self.replay_columns:
+                raise ValueError("Replay header changed between startup and source scan")
+            records = iter(handle)
+            skip_checkpointed_records(records, phase.next_source_row, self.progress_every)
+            LOG.info("Replay scan: processing new source rows.")
+            for record in records:
+                source_row += 1
+                raw_since_commit += 1
+                draft_id = csv_field_at(record, draft_position)
+                if draft_id in target_draft_ids:
+                    row = parse_csv_record(record, len(self.replay_columns), "replay", source_row)
+                    rows.append([row[position] for position in wanted_indices])
+                if len(rows) >= chunk_limit or raw_since_commit >= 100_000:
+                    commit_progress(source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    LOG.info(
+                        "Replay scan: %s rows read; %s relevant games processed; drafts %s/%s.",
+                        f"{source_row:,}",
+                        f"{total_replays + len(rows):,}",
+                        f"{current_checkpoint:,}",
+                        f"{total_drafts:,}",
+                    )
+
+        commit_progress(source_row, complete=True)
+        missing = [
+            (draft_id, values[2], values[1])
+            for draft_id, values in status_by_id.items()
+            if not values[3]
+        ][:10]
+        if missing:
+            raise ValueError(f"Replay source completed before all games were found: {missing}")
+        con.execute("CHECKPOINT")
+        LOG.info(
+            "Phase 3/3 replay scan complete: %s rows; %s relevant games; %.1fs.",
+            f"{source_row:,}",
+            f"{total_replays:,}",
+            time.monotonic() - started,
+        )
 
     def sync_reference_tables(
         self,
@@ -1051,16 +2180,11 @@ class DatabaseBuilder:
             con.execute("ROLLBACK")
             raise
 
-        LOG.info(
-            "Draft %s committed: %d games; checkpoint draft index %d.",
-            draft_id,
-            len(game_batch),
-            checkpoint.next_draft_index + 1,
-        )
 
     def build_draft_rows(self, game_batch: pd.DataFrame) -> dict[str, dict[str, Any]]:
+        columns = [column for column in ("draft_id", "expansion", "event_type", "draft_time") if column in game_batch.columns]
         result: dict[str, dict[str, Any]] = {}
-        for record in game_batch.to_dict("records"):
+        for record in game_batch[columns].to_dict("records"):
             draft_id = str(record["draft_id"])
             row = {
                 "draft_id": draft_id,
@@ -1098,50 +2222,40 @@ class DatabaseBuilder:
         game_batch: pd.DataFrame,
     ) -> tuple[list[int | None], dict[tuple[str, int], dict[int, tuple[int, int]]]]:
         assert self.reference is not None
-        build_columns = [
-            item["column"]
-            for item in self.game_card_columns
-            if item["stat"] in {"deck", "sideboard"}
-        ]
+        items = [item for item in self.game_card_columns if item["stat"] in {"deck", "sideboard"}]
+        build_columns = [item["column"] for item in items]
         if not build_columns:
             return [None] * len(game_batch), {}
 
-        matrix = numeric_count_matrix(game_batch, build_columns)
-        column_info = {
-            item["column"]: item
-            for item in self.game_card_columns
-            if item["stat"] in {"deck", "sideboard"}
-        }
+        matrix = numeric_count_matrix(game_batch, build_columns).to_numpy(copy=False)
+        card_ids = np.array(
+            [self.reference.card_name_to_id[item["card_name"]] for item in items],
+            dtype=np.int64,
+        )
+        slots = np.array([0 if item["stat"] == "deck" else 1 for item in items], dtype=np.int8)
+        metadata = game_batch[["draft_id", "build_index"]].itertuples(index=False, name=None)
         compositions: dict[tuple[str, int], dict[int, tuple[int, int]]] = {}
         build_ids: list[int | None] = []
 
-        for position, record in enumerate(game_batch[["draft_id", "build_index"]].to_dict("records")):
-            draft_id = str(record["draft_id"])
-            build_index = integer_or_none(record.get("build_index"))
+        for position, (draft_raw, build_raw) in enumerate(metadata):
+            draft_id = str(draft_raw)
+            build_index = integer_or_none(build_raw)
             if build_index is None:
                 build_ids.append(None)
                 continue
-
-            card_counts: dict[int, list[int]] = defaultdict(lambda: [0, 0])
-            for column, raw_count in matrix.iloc[position].items():
-                count = int(raw_count)
-                if count == 0:
-                    continue
-                info = column_info[column]
-                card_id = self.reference.card_name_to_id[info["card_name"]]
-                slot = 0 if info["stat"] == "deck" else 1
-                card_counts[card_id][slot] = count
-            composition = {
-                card_id: (counts[0], counts[1])
-                for card_id, counts in card_counts.items()
-            }
+            counts_by_card: dict[int, list[int]] = {}
+            for column_index in np.flatnonzero(matrix[position]):
+                count = int(matrix[position, column_index])
+                card_id = int(card_ids[column_index])
+                slot = int(slots[column_index])
+                counts_by_card.setdefault(card_id, [0, 0])[slot] = count
+            composition = {card_id: (counts[0], counts[1]) for card_id, counts in counts_by_card.items()}
             key = (draft_id, build_index)
             previous = compositions.get(key)
             if previous is not None and previous != composition:
                 raise ValueError(f"Deck composition changed within batch for {key}")
             compositions[key] = composition
             build_ids.append(make_build_id(draft_id, build_index))
-
         return build_ids, compositions
 
     def ensure_deck_builds(
@@ -1200,21 +2314,26 @@ class DatabaseBuilder:
         game_ids: list[int],
         build_ids: list[int | None],
     ) -> list[dict[str, Any]]:
-        rows = []
-        for position, record in enumerate(game_batch.to_dict("records")):
-            rows.append(
-                {
-                    "game_id": game_ids[position],
-                    "draft_id": str(record["draft_id"]),
-                    "build_id": build_ids[position],
-                    "match_number": integer_or_none(record.get("match_number")),
-                    "game_number": integer_or_none(record.get("game_number")),
-                    "game_time": timestamp_or_none(record.get("game_time")),
-                    "user_on_play": parse_bool(record.get("on_play")),
-                    "user_won": parse_bool(record.get("won")),
-                    "source_num_turns": integer_or_none(record.get("num_turns")),
-                }
+        columns = [
+            column for column in (
+                "draft_id", "match_number", "game_number", "game_time",
+                "on_play", "won", "num_turns",
             )
+            if column in game_batch.columns
+        ]
+        rows = []
+        for position, record in enumerate(game_batch[columns].to_dict("records")):
+            rows.append({
+                "game_id": game_ids[position],
+                "draft_id": str(record["draft_id"]),
+                "build_id": build_ids[position],
+                "match_number": integer_or_none(record.get("match_number")),
+                "game_number": integer_or_none(record.get("game_number")),
+                "game_time": timestamp_or_none(record.get("game_time")),
+                "user_on_play": parse_bool(record.get("on_play")),
+                "user_won": parse_bool(record.get("won")),
+                "source_num_turns": integer_or_none(record.get("num_turns")),
+            })
         return rows
 
     def build_player_rows(
@@ -1262,57 +2381,78 @@ class DatabaseBuilder:
         game_ids: list[int],
     ) -> list[dict[str, Any]]:
         assert self.reference is not None
-        stats: dict[tuple[int, int], dict[str, int]] = defaultdict(
-            lambda: {"opening_hand": 0, "drawn": 0, "tutored": 0}
-        )
-        for item in self.game_card_columns:
-            stat = item["stat"]
-            if stat not in GAME_STAT_PREFIXES:
-                continue
-            values = pd.to_numeric(game_batch[item["column"]], errors="coerce").fillna(0)
-            positions = np.flatnonzero(values.to_numpy())
-            if not len(positions):
-                continue
-            card_id = self.reference.card_name_to_id[item["card_name"]]
-            for position in positions:
-                count = int(values.iloc[position])
-                if count < 0:
-                    raise ValueError(f"Negative card count in {item['column']}")
-                stats[(game_ids[position], card_id)][stat] = count
-
+        items = [item for item in self.game_card_columns if item["stat"] in GAME_STAT_PREFIXES]
+        if not items:
+            return []
+        columns = [item["column"] for item in items]
+        matrix = numeric_count_matrix(game_batch, columns).to_numpy(copy=False)
+        card_ids = [self.reference.card_name_to_id[item["card_name"]] for item in items]
+        stat_slots = [{"opening_hand": 0, "drawn": 1, "tutored": 2}[item["stat"]] for item in items]
+        stats: dict[tuple[int, int], list[int]] = {}
+        row_indices, column_indices = np.nonzero(matrix)
+        for row_index, column_index in zip(row_indices.tolist(), column_indices.tolist(), strict=True):
+            count = int(matrix[row_index, column_index])
+            if count < 0:
+                raise ValueError(f"Negative card count in {columns[column_index]}")
+            key = (game_ids[row_index], int(card_ids[column_index]))
+            values = stats.setdefault(key, [0, 0, 0])
+            values[stat_slots[column_index]] = count
         return [
             {
-                "game_id": game_id,
-                "card_id": card_id,
-                "opening_hand_count": values["opening_hand"],
-                "drawn_count": values["drawn"],
-                "tutored_count": values["tutored"],
+                "game_id": game_id, "card_id": card_id,
+                "opening_hand_count": values[0], "drawn_count": values[1],
+                "tutored_count": values[2],
             }
             for (game_id, card_id), values in stats.items()
-            if any(values.values())
         ]
+
+    def turn_meaningful_positions(self, replay_batch: pd.DataFrame) -> dict[str, np.ndarray]:
+        positions: dict[str, np.ndarray] = {}
+        for column in self.turn_columns:
+            if column not in replay_batch.columns:
+                continue
+            values = replay_batch[column].to_numpy(copy=False)
+            # These frames are created directly from csv strings, so missing values are
+            # empty strings. Avoid pandas StringDtype/strip/lower work in the hot path.
+            mask = (values != "") & (values != "0") & (values != "0.0")
+            found = np.flatnonzero(mask)
+            if len(found):
+                positions[column] = found
+        return positions
 
     def find_turns(
         self,
         replay_batch: pd.DataFrame,
         game_ids: list[int],
+        positions_by_column: dict[str, np.ndarray] | None = None,
     ) -> set[tuple[int, str, int]]:
         active: set[tuple[int, str, int]] = set()
-        for column, (source_side, source_turn_index, _) in self.turn_columns.items():
-            if column not in replay_batch.columns:
-                continue
-            mask = meaningful_mask(replay_batch[column])
-            for position in np.flatnonzero(mask.to_numpy()):
-                active.add((game_ids[position], source_side, source_turn_index))
+        positions_by_column = positions_by_column or self.turn_meaningful_positions(replay_batch)
+        for column, positions in positions_by_column.items():
+            source_side, source_turn_index, _ = self.turn_columns[column]
+            for position in positions:
+                active.add((game_ids[int(position)], source_side, source_turn_index))
         return active
+
+    def make_turn_id_map(
+        self,
+        active: set[tuple[int, str, int]],
+    ) -> dict[tuple[int, str, int], int]:
+        # turn_id is reused by the turn row, events, states and zones. Hash it once.
+        return {
+            key: make_turn_id(*key)
+            for key in active
+        }
 
     def build_turn_rows(
         self,
         active: set[tuple[int, str, int]],
+        turn_id_map: dict[tuple[int, str, int], int] | None = None,
     ) -> list[dict[str, Any]]:
+        turn_id_map = turn_id_map or self.make_turn_id_map(active)
         return [
             {
-                "turn_id": make_turn_id(game_id, source_side, source_turn_index),
+                "turn_id": turn_id_map[(game_id, source_side, source_turn_index)],
                 "game_id": game_id,
                 "is_user_turn": source_side == "user",
                 "source_turn_index": source_turn_index,
@@ -1324,74 +2464,55 @@ class DatabaseBuilder:
         self,
         replay_batch: pd.DataFrame,
         game_ids: list[int],
+        positions_by_column: dict[str, np.ndarray] | None = None,
+        turn_id_map: dict[tuple[int, str, int], int] | None = None,
     ) -> list[dict[str, Any]]:
         assert self.reference is not None
         rows: list[dict[str, Any]] = []
+        positions_by_column = positions_by_column or self.turn_meaningful_positions(replay_batch)
+        turn_id_map = turn_id_map or self.make_turn_id_map(
+            self.find_turns(replay_batch, game_ids, positions_by_column)
+        )
         for column, rule in self.event_columns.items():
-            if column not in replay_batch.columns:
+            positions = positions_by_column.get(column)
+            if positions is None:
                 continue
+            values = replay_batch[column].to_numpy(copy=False)
             source_side, source_turn_index, _ = self.turn_columns[column]
-            mask = meaningful_mask(replay_batch[column])
-            for position in np.flatnonzero(mask.to_numpy()):
+            actor = resolve_player(rule.actor, source_side)
+            affected = resolve_player(rule.affected, source_side)
+            for position_raw in positions:
+                position = int(position_raw)
                 game_id = game_ids[position]
-                value = replay_batch.iloc[position][column]
-                source_turn_id = make_turn_id(game_id, source_side, source_turn_index)
-                # Generic cast/draw/discard buckets identify who acted, but not always whose turn it was.
+                value = values[position]
+                source_turn_id = turn_id_map[(game_id, source_side, source_turn_index)]
                 actual_turn_id = source_turn_id if rule.exact_turn else None
-                actor = resolve_player(rule.actor, source_side)
-                affected = resolve_player(rule.affected, source_side)
-
                 if rule.payload == "card":
                     for ordinal, token in enumerate(split_ids(value), start=1):
                         arena_id = parse_source_id(token)
-                        rows.append(
-                            event_row(
-                                game_id=game_id,
-                                source_turn_id=source_turn_id,
-                                actual_turn_id=actual_turn_id,
-                                source_field=column,
-                                source_ordinal=ordinal,
-                                event_type=rule.event_type,
-                                actor_is_user=actor,
-                                affected_is_user=affected,
-                                source_arena_card_id=arena_id,
-                                card_id=self.reference.arena_to_card_id.get(arena_id),
-                            )
-                        )
+                        rows.append(event_row(
+                            game_id=game_id, source_turn_id=source_turn_id, actual_turn_id=actual_turn_id,
+                            source_field=column, source_ordinal=ordinal, event_type=rule.event_type,
+                            actor_is_user=actor, affected_is_user=affected, source_arena_card_id=arena_id,
+                            card_id=self.reference.arena_to_card_id.get(arena_id),
+                        ))
                 elif rule.payload == "ability":
                     for ordinal, token in enumerate(split_ids(value), start=1):
                         ability_id = parse_source_id(token)
-                        rows.append(
-                            event_row(
-                                game_id=game_id,
-                                source_turn_id=source_turn_id,
-                                actual_turn_id=actual_turn_id,
-                                source_field=column,
-                                source_ordinal=ordinal,
-                                event_type=rule.event_type,
-                                actor_is_user=actor,
-                                affected_is_user=affected,
-                                source_ability_id=ability_id,
-                                ability_id=ability_id if ability_id in self.reference.ability_ids else None,
-                            )
-                        )
+                        rows.append(event_row(
+                            game_id=game_id, source_turn_id=source_turn_id, actual_turn_id=actual_turn_id,
+                            source_field=column, source_ordinal=ordinal, event_type=rule.event_type,
+                            actor_is_user=actor, affected_is_user=affected, source_ability_id=ability_id,
+                            ability_id=ability_id if ability_id in self.reference.ability_ids else None,
+                        ))
                 elif rule.payload == "numeric":
                     numeric = numeric_or_none(value)
-                    if numeric is None or numeric == 0:
-                        continue
-                    rows.append(
-                        event_row(
-                            game_id=game_id,
-                            source_turn_id=source_turn_id,
-                            actual_turn_id=actual_turn_id,
-                            source_field=column,
-                            source_ordinal=1,
-                            event_type=rule.event_type,
-                            actor_is_user=actor,
-                            affected_is_user=affected,
-                            numeric_value=numeric,
-                        )
-                    )
+                    if numeric is not None and numeric != 0:
+                        rows.append(event_row(
+                            game_id=game_id, source_turn_id=source_turn_id, actual_turn_id=actual_turn_id,
+                            source_field=column, source_ordinal=1, event_type=rule.event_type,
+                            actor_is_user=actor, affected_is_user=affected, numeric_value=numeric,
+                        ))
                 else:
                     raise ValueError(f"Unknown event payload {rule.payload!r}")
         return rows
@@ -1404,45 +2525,35 @@ class DatabaseBuilder:
         assert self.reference is not None
         hand_rows: list[dict[str, Any]] = []
         card_rows: list[dict[str, Any]] = []
-
-        for position, record in enumerate(replay_batch.to_dict("records")):
-            game_id = game_ids[position]
-            mulligans = integer_or_none(record.get("num_mulligans"))
-            candidates = [
-                (attempt, cards)
-                for attempt, column in enumerate(self.candidate_columns, start=1)
-                if (cards := split_ids(record.get(column)))
-            ]
+        columns = ["num_mulligans", "opening_hand", *self.candidate_columns]
+        arrays = {column: replay_batch[column].to_numpy(copy=False) for column in columns if column in replay_batch.columns}
+        for position, game_id in enumerate(game_ids):
+            mulligans = integer_or_none(arrays["num_mulligans"][position])
+            candidates = []
+            for attempt, column in enumerate(self.candidate_columns, start=1):
+                cards = split_ids(arrays[column][position])
+                if cards:
+                    candidates.append((attempt, cards))
             if mulligans is None or len(candidates) != mulligans + 1:
                 raise ValueError(f"Candidate-hand count mismatch for game {game_id}")
             if any(len(cards) != 7 for _, cards in candidates):
                 raise ValueError(f"Non-seven-card candidate hand for game {game_id}")
-
-            # The final candidate is the kept seven and still includes cards later put on the bottom.
             final_attempt, final_cards = candidates[-1]
-            if Counter(final_cards) != Counter(split_ids(record.get("opening_hand"))):
+            if Counter(final_cards) != Counter(split_ids(arrays["opening_hand"][position])):
                 raise ValueError(f"opening_hand differs from final candidate for game {game_id}")
-
             for attempt, cards in candidates:
                 hand_id = make_hand_id(game_id, attempt)
-                hand_rows.append(
-                    {
-                        "hand_id": hand_id,
-                        "game_id": game_id,
-                        "attempt_number": attempt,
-                        "is_final_candidate": attempt == final_attempt,
-                    }
-                )
+                hand_rows.append({
+                    "hand_id": hand_id, "game_id": game_id, "attempt_number": attempt,
+                    "is_final_candidate": attempt == final_attempt,
+                })
                 for slot_number, token in enumerate(cards, start=1):
                     arena_id = parse_source_id(token)
-                    card_rows.append(
-                        {
-                            "hand_id": hand_id,
-                            "slot_number": slot_number,
-                            "source_arena_card_id": arena_id,
-                            "card_id": self.reference.arena_to_card_id.get(arena_id),
-                        }
-                    )
+                    card_rows.append({
+                        "hand_id": hand_id, "slot_number": slot_number,
+                        "source_arena_card_id": arena_id,
+                        "card_id": self.reference.arena_to_card_id.get(arena_id),
+                    })
         return hand_rows, card_rows
 
     def build_turn_state_and_zones(
@@ -1450,54 +2561,45 @@ class DatabaseBuilder:
         replay_batch: pd.DataFrame,
         game_ids: list[int],
         active_turns: set[tuple[int, str, int]],
+        turn_id_map: dict[tuple[int, str, int], int] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         assert self.reference is not None
         positions = {game_id: position for position, game_id in enumerate(game_ids)}
+        turn_id_map = turn_id_map or self.make_turn_id_map(active_turns)
+        arrays = {column: replay_batch[column].to_numpy(copy=False) for column in replay_batch.columns}
         state_rows: list[dict[str, Any]] = []
         zone_rows: list[dict[str, Any]] = []
 
+        def raw(column: str, position: int) -> Any:
+            values = arrays.get(column)
+            return None if values is None else values[position]
+
         for game_id, source_side, source_turn_index in sorted(active_turns):
-            record = replay_batch.iloc[positions[game_id]]
-            turn_id = make_turn_id(game_id, source_side, source_turn_index)
+            position = positions[game_id]
+            turn_id = turn_id_map[(game_id, source_side, source_turn_index)]
             stem = f"{source_side}_turn_{source_turn_index}_"
-
             for player_is_user, player in ((True, "user"), (False, "oppo")):
-                life = numeric_or_none(record.get(f"{stem}eot_{player}_life"))
-                poison = numeric_or_none(record.get(f"{stem}eot_{player}_poison_counters"))
-                mana_spent = numeric_or_none(record.get(f"{stem}{player}_mana_spent"))
+                life = numeric_or_none(raw(f"{stem}eot_{player}_life", position))
+                poison = numeric_or_none(raw(f"{stem}eot_{player}_poison_counters", position))
+                mana_spent = numeric_or_none(raw(f"{stem}{player}_mana_spent", position))
                 if player_is_user:
-                    raw_hand = record.get(f"{stem}eot_user_cards_in_hand")
-                    hand_size = None if is_missing_or_blank(raw_hand) else len(split_ids(raw_hand))
+                    hand_raw = raw(f"{stem}eot_user_cards_in_hand", position)
+                    hand_size = None if is_missing_or_blank(hand_raw) else len(split_ids(hand_raw))
                 else:
-                    hand_size = integer_or_none(record.get(f"{stem}eot_oppo_cards_in_hand"))
+                    hand_size = integer_or_none(raw(f"{stem}eot_oppo_cards_in_hand", position))
                 if any(value is not None for value in (life, poison, mana_spent, hand_size)):
-                    state_rows.append(
-                        {
-                            "turn_id": turn_id,
-                            "player_is_user": player_is_user,
-                            "life": life,
-                            "poison_counters": poison,
-                            "hand_size": hand_size,
-                            "mana_spent": mana_spent,
-                        }
-                    )
-
+                    state_rows.append({
+                        "turn_id": turn_id, "player_is_user": player_is_user, "life": life,
+                        "poison_counters": poison, "hand_size": hand_size, "mana_spent": mana_spent,
+                    })
             for suffix, (owner_is_user, zone) in ZONE_FIELDS.items():
-                counts = Counter(
-                    parse_source_id(token)
-                    for token in split_ids(record.get(stem + suffix))
-                )
+                counts = Counter(parse_source_id(token) for token in split_ids(raw(stem + suffix, position)))
                 for arena_id, quantity in counts.items():
-                    zone_rows.append(
-                        {
-                            "turn_id": turn_id,
-                            "owner_is_user": owner_is_user,
-                            "zone": zone,
-                            "source_arena_card_id": arena_id,
-                            "card_id": self.reference.arena_to_card_id.get(arena_id),
-                            "quantity": quantity,
-                        }
-                    )
+                    zone_rows.append({
+                        "turn_id": turn_id, "owner_is_user": owner_is_user, "zone": zone,
+                        "source_arena_card_id": arena_id,
+                        "card_id": self.reference.arena_to_card_id.get(arena_id), "quantity": quantity,
+                    })
         return state_rows, zone_rows
 
     def build_total_rows(
@@ -1505,17 +2607,15 @@ class DatabaseBuilder:
         replay_batch: pd.DataFrame,
         game_ids: list[int],
     ) -> list[dict[str, Any]]:
+        arrays = {column: replay_batch[column].to_numpy(copy=False) for column in replay_batch.columns}
         rows = []
-        for position, record in enumerate(replay_batch.to_dict("records")):
+        for position, game_id in enumerate(game_ids):
             for is_user, side in ((True, "user"), (False, "oppo")):
-                row: dict[str, Any] = {"game_id": game_ids[position], "is_user": is_user}
+                row: dict[str, Any] = {"game_id": game_id, "is_user": is_user}
                 for output_name, source_suffix in TOTAL_FIELDS.items():
                     source_column = f"{side}_{source_suffix}"
-                    row[output_name] = (
-                        numeric_or_none(record.get(source_column))
-                        if source_column in replay_batch.columns
-                        else None
-                    )
+                    values = arrays.get(source_column)
+                    row[output_name] = None if values is None else numeric_or_none(values[position])
                 rows.append(row)
         return rows
 
@@ -1853,132 +2953,6 @@ def validate_batch_rows(
         raise ValueError("Every game must have exactly one final candidate hand")
 
 
-def extract_replay_rows(
-    replay_file: Path,
-    replay_header: list[str],
-    wanted_columns: list[str],
-    ordered_keys: list[tuple[str, int, int]],
-    progress_every: int,
-) -> tuple[pd.DataFrame, int]:
-    target = set(ordered_keys)
-    if len(target) != len(ordered_keys):
-        raise ValueError("Duplicate natural game key requested from replay data")
-
-    index = {column: position for position, column in enumerate(replay_header)}
-    missing_columns = [column for column in wanted_columns if column not in index]
-    if missing_columns:
-        raise ValueError(f"Replay CSV missing requested columns: {missing_columns[:20]}")
-    key_indices = [index[column] for column in GAME_KEY]
-    wanted_indices = [(column, index[column]) for column in wanted_columns]
-
-    # Store compact value lists rather than one dict per wide replay row.
-    found: dict[tuple[str, int, int], list[str]] = {}
-    rows_scanned = 0
-    with open_csv_text(replay_file) as handle:
-        reader = csv.reader(handle)
-        header = next(reader)
-        if header != replay_header:
-            raise ValueError("Replay header changed between startup and batch scan")
-
-        for row in reader:
-            rows_scanned += 1
-            if len(row) != len(replay_header):
-                raise ValueError(
-                    f"Malformed replay CSV row {rows_scanned}: {len(row)} fields, "
-                    f"expected {len(replay_header)}"
-                )
-            key = (
-                row[key_indices[0]],
-                parse_key_integer(row[key_indices[1]]),
-                parse_key_integer(row[key_indices[2]]),
-            )
-            if key in target and key not in found:
-                found[key] = [row[position] for _, position in wanted_indices]
-                if len(found) == len(target):
-                    break
-            if progress_every > 0 and rows_scanned % progress_every == 0:
-                LOG.info(
-                    "Replay scan progress: %d rows; found %d/%d target games",
-                    rows_scanned,
-                    len(found),
-                    len(target),
-                )
-
-    missing = [key for key in ordered_keys if key not in found]
-    if missing:
-        raise ValueError(
-            f"Replay scan ended with {len(missing)} game rows missing; first keys: {missing[:10]}"
-        )
-    frame = pd.DataFrame([found[key] for key in ordered_keys], columns=wanted_columns)
-    return frame, rows_scanned
-
-
-def collect_game_draft_ids_ordered(
-    game_file: Path,
-    game_header: list[str],
-) -> list[str]:
-    """Return unique draft IDs in first-seen order; game rows need not be contiguous."""
-    index = {column: position for position, column in enumerate(game_header)}
-    draft_index = index["draft_id"]
-    result: list[str] = []
-    seen: set[str] = set()
-
-    with open_csv_text(game_file) as handle:
-        reader = csv.reader(handle)
-        header = next(reader)
-        if header != game_header:
-            raise ValueError("Game header changed between startup and scan")
-        for row in reader:
-            draft_id = row[draft_index]
-            if draft_id not in seen:
-                seen.add(draft_id)
-                result.append(draft_id)
-
-    if not result:
-        raise ValueError(f"No draft IDs found in game file {game_file}")
-    return result
-
-
-def iter_game_draft_batches(
-    game_file: Path,
-    game_header: list[str],
-    wanted_columns: list[str],
-    ordered_draft_ids: list[str],
-    drafts_per_batch: int,
-    start_draft_index: int,
-) -> Iterator[tuple[int, list[str], pd.DataFrame]]:
-    """Gather all game rows for each batch of draft IDs, regardless of source order."""
-    index = {column: position for position, column in enumerate(game_header)}
-    wanted_indices = [index[column] for column in wanted_columns]
-    draft_index = index["draft_id"]
-
-    for batch_start in range(start_draft_index, len(ordered_draft_ids), drafts_per_batch):
-        batch_ids = ordered_draft_ids[batch_start:batch_start + drafts_per_batch]
-        target = set(batch_ids)
-        rows: list[list[str]] = []
-
-        with open_csv_text(game_file) as handle:
-            reader = csv.reader(handle)
-            header = next(reader)
-            if header != game_header:
-                raise ValueError("Game header changed between startup and batch scan")
-            for row in reader:
-                if row[draft_index] in target:
-                    rows.append([row[position] for position in wanted_indices])
-
-        if not rows:
-            raise ValueError(
-                f"No game rows found for draft batch {batch_start}.."
-                f"{batch_start + len(batch_ids) - 1}"
-            )
-        frame = pd.DataFrame(rows, columns=wanted_columns)
-        found = set(frame["draft_id"].astype(str))
-        missing = target - found
-        if missing:
-            raise ValueError(f"Game CSV missing expected drafts: {sorted(missing)[:10]}")
-        yield batch_start, batch_ids, frame
-
-
 def parse_game_card_columns(columns: Iterable[str]) -> list[dict[str, str]]:
     parsed = []
     for column in columns:
@@ -2141,20 +3115,36 @@ def make_event_id(game_id: int, source_field: str, source_ordinal: int) -> int:
 
 
 def split_ids(value: Any) -> list[str]:
-    if is_missing_or_blank(value):
+    if value is None:
         return []
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "<na>"}:
+    if isinstance(value, str):
+        if value == "":
+            return []
+        # Replay ID lists are normally already canonical integer strings separated
+        # by pipes. Avoid strip/lower/list filtering on that common path.
+        if " " not in value and "\t" not in value and value not in {"nan", "none", "<na>"}:
+            return value.split("|")
+        text = value.strip()
+    else:
+        if is_missing_or_blank(value):
+            return []
+        text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>"}:
         return []
     return [token.strip() for token in text.split("|") if token.strip()]
 
 
 def parse_source_id(token: Any) -> int:
-    text = str(token).strip()
+    if isinstance(token, str):
+        try:
+            return int(token)
+        except ValueError:
+            text = token.strip()
+            return int(float(text))
     try:
-        return int(text)
-    except ValueError:
-        return int(float(text))
+        return int(token)
+    except (TypeError, ValueError):
+        return int(float(token))
 
 
 def parse_key_integer(value: str) -> int:
@@ -2232,10 +3222,20 @@ def normalize_card_name(name: str) -> str:
 
 
 def numeric_count_matrix(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    matrix = frame[columns].apply(pd.to_numeric, errors="coerce").fillna(0)
-    if (matrix < 0).any().any():
-        raise ValueError("Negative deck/sideboard count found")
-    return matrix.astype("int16")
+    raw = frame[columns].to_numpy(copy=False)
+    try:
+        # Source frames come directly from csv.reader, so blank and integer strings
+        # dominate. NumPy conversion avoids one pd.to_numeric call per wide column.
+        normalized = np.where(raw == "", "0", raw)
+        matrix = normalized.astype(np.int16)
+        if (matrix < 0).any():
+            raise ValueError("Negative deck/sideboard count found")
+        return pd.DataFrame(matrix, columns=columns, index=frame.index)
+    except (TypeError, ValueError):
+        matrix = frame[columns].apply(pd.to_numeric, errors="coerce").fillna(0)
+        if (matrix < 0).any().any():
+            raise ValueError("Negative deck/sideboard count found")
+        return matrix.astype("int16")
 
 
 def clean_json_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -2313,10 +3313,119 @@ def insert_rows(
         con.unregister(temp_name)
 
 
+def insert_or_validate_draft_rows(
+    con: duckdb.DuckDBPyConnection,
+    pick_rows: list[tuple[int, str, int, int, int, float | None, float | None]],
+    pick_card_rows: list[tuple[int, int, int, int]],
+) -> None:
+    """Insert missing draft rows and verify any rows already present match source.
+
+    Draft ingestion uses tuples rather than one Python dict per normalized row. This
+    matters for draft_pick_cards, where a 10k-pick chunk can contain hundreds of
+    thousands of child rows.
+    """
+    if pick_rows:
+        pick_frame = pd.DataFrame.from_records(
+            pick_rows,
+            columns=(
+                "pick_id", "draft_id", "pack_number", "pick_number", "card_id",
+                "pick_maindeck_rate", "pick_sideboard_in_rate",
+            ),
+        )
+        pick_frame["pick_id"] = pick_frame["pick_id"].astype("int64")
+        pick_frame["card_id"] = pick_frame["card_id"].astype("int64")
+        pick_frame["pack_number"] = pick_frame["pack_number"].astype("int16")
+        pick_frame["pick_number"] = pick_frame["pick_number"].astype("int16")
+        con.register("_draft_pick_chunk", pick_frame)
+        try:
+            mismatch = con.execute(
+                """
+                SELECT s.pick_id
+                FROM _draft_pick_chunk s
+                JOIN draft_picks p USING (pick_id)
+                WHERE p.draft_id IS DISTINCT FROM s.draft_id
+                   OR p.pack_number IS DISTINCT FROM s.pack_number
+                   OR p.pick_number IS DISTINCT FROM s.pick_number
+                   OR p.card_id IS DISTINCT FROM s.card_id
+                   OR CAST(p.pick_maindeck_rate AS REAL)
+                      IS DISTINCT FROM CAST(s.pick_maindeck_rate AS REAL)
+                   OR CAST(p.pick_sideboard_in_rate AS REAL)
+                      IS DISTINCT FROM CAST(s.pick_sideboard_in_rate AS REAL)
+                LIMIT 10
+                """
+            ).fetchall()
+            if mismatch:
+                raise ValueError(
+                    f"Existing draft_picks rows differ from source for pick IDs: "
+                    f"{[int(row[0]) for row in mismatch]}"
+                )
+            con.execute(
+                """
+                INSERT INTO draft_picks (
+                    pick_id, draft_id, pack_number, pick_number, card_id,
+                    pick_maindeck_rate, pick_sideboard_in_rate
+                )
+                SELECT
+                    s.pick_id, s.draft_id, s.pack_number, s.pick_number, s.card_id,
+                    s.pick_maindeck_rate, s.pick_sideboard_in_rate
+                FROM _draft_pick_chunk s
+                LEFT JOIN draft_picks p USING (pick_id)
+                WHERE p.pick_id IS NULL
+                """
+            )
+        finally:
+            con.unregister("_draft_pick_chunk")
+
+    if pick_card_rows:
+        card_frame = pd.DataFrame.from_records(
+            pick_card_rows,
+            columns=("pick_id", "card_id", "pack_count", "pool_count"),
+        )
+        card_frame["pick_id"] = card_frame["pick_id"].astype("int64")
+        card_frame["card_id"] = card_frame["card_id"].astype("int64")
+        card_frame["pack_count"] = card_frame["pack_count"].astype("int16")
+        card_frame["pool_count"] = card_frame["pool_count"].astype("int16")
+        con.register("_draft_pick_card_chunk", card_frame)
+        try:
+            mismatch = con.execute(
+                """
+                SELECT s.pick_id, s.card_id
+                FROM _draft_pick_card_chunk s
+                JOIN draft_pick_cards c
+                  ON c.pick_id = s.pick_id AND c.card_id = s.card_id
+                WHERE c.pack_count IS DISTINCT FROM s.pack_count
+                   OR c.pool_count IS DISTINCT FROM s.pool_count
+                LIMIT 10
+                """
+            ).fetchall()
+            if mismatch:
+                raise ValueError(
+                    "Existing draft_pick_cards rows differ from source for keys: "
+                    f"{[(int(a), int(b)) for a, b in mismatch]}"
+                )
+            con.execute(
+                """
+                INSERT INTO draft_pick_cards (
+                    pick_id, card_id, pack_count, pool_count
+                )
+                SELECT s.pick_id, s.card_id, s.pack_count, s.pool_count
+                FROM _draft_pick_card_chunk s
+                LEFT JOIN draft_pick_cards c
+                  ON c.pick_id = s.pick_id AND c.card_id = s.card_id
+                WHERE c.pick_id IS NULL
+                """
+            )
+        finally:
+            con.unregister("_draft_pick_card_chunk")
+
+
 def open_csv_text(path: Path):
     if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8", newline="")
-    return path.open("r", encoding="utf-8", newline="")
+        raw = path.open("rb", buffering=8 * 1024 * 1024)
+        gz = gzip.GzipFile(fileobj=raw, mode="rb")
+        buffered = io.BufferedReader(gz, buffer_size=8 * 1024 * 1024)
+        return io.TextIOWrapper(buffered, encoding="utf-8", newline="")
+    return path.open("r", encoding="utf-8", newline="", buffering=8 * 1024 * 1024)
 
 
 def read_header(path: Path) -> list[str]:
@@ -2475,14 +3584,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=100,
-        help="Number of drafts processed together through draft/game/replay source scans.",
+        default=1000,
+        help="Base transaction chunk size. Source files are scanned once regardless of this value.",
     )
     parser.add_argument(
-        "--replay-progress-every",
+        "--progress-every",
         type=int,
-        default=500_000,
-        help="Log replay-scan progress every N rows; use 0 to disable.",
+        default=250_000,
+        help="Log source-scan progress every N rows for order/draft/game/replay; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--s3-backup-every-minutes",
+        type=float,
+        metavar="MINUTES",
+        help=(
+            "Opt in to periodic S3 snapshots. After committed chunks, upload at most once "
+            "per MINUTES to s3://alistairbegg-personal-projects/mtg_card_embeddings/data/. "
+            "A final snapshot is also uploaded after a successful build. Omit this option "
+            "to disable all S3 backup activity."
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
@@ -2499,6 +3619,19 @@ def main() -> None:
     LOG.info("Output: %s", datasets[0].output)
     LOG.info("Datasets selected: %d", len(datasets))
 
+    s3_backup = None
+    if args.s3_backup_every_minutes is not None:
+        s3_backup = S3BackupManager(
+            datasets[0].output,
+            args.s3_backup_every_minutes,
+        )
+        LOG.info(
+            "Periodic S3 backup enabled: every %.2f minutes to s3://%s/%s.",
+            args.s3_backup_every_minutes,
+            S3_BUCKET,
+            S3_DATABASE_KEY,
+        )
+
     for index, paths in enumerate(datasets, start=1):
         LOG.info("Dataset %d/%d: %s", index, len(datasets), paths.dataset_id)
         LOG.info("Draft CSV: %s", paths.draft_file)
@@ -2508,8 +3641,15 @@ def main() -> None:
             paths=paths,
             batch_size=args.batch_size,
             overwrite=args.overwrite and index == 1,
-            replay_progress_every=args.replay_progress_every,
+            progress_every=args.progress_every,
+            s3_backup=s3_backup,
         ).run()
+
+    if s3_backup is not None:
+        # Ensure a successful invocation leaves the newest completed state in S3 even
+        # when the run finishes before the periodic interval elapses.
+        with duckdb.connect(str(datasets[0].output)) as con:
+            s3_backup.maybe_upload(con, reason="successful build completion", force=True)
 
 
 if __name__ == "__main__":
