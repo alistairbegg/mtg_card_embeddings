@@ -10,11 +10,16 @@
 - `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
 ## 3. Sync Env
 - `uv sync`
-## 4. Download Database
-- `uv run python -m scripts.download_db [url]` *(I will generate temporary url)*
-## 5. Run Python
+## 4. Run Python
 - Use `uv run python ...` for all scripts
 - Select .venv/bin/python as the notebook kernel/interpreter
+
+# Querying DB
+
+- `from utils.db import get_db_connection, query_db`
+- Open connection using `con = get_db_connection()`
+- Query db using `query_db(con, query, params)`
+- Close connection when done using `con.close()`
 
 # Database Structure
 
