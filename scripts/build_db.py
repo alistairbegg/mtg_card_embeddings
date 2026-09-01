@@ -4073,10 +4073,17 @@ def main() -> None:
                 progress.finish_stage(1)
 
         if s3_backup is not None:
-            # Ensure a successful invocation leaves the newest completed state in S3 even
-            # when the run finishes before the periodic interval elapses.
+            # A completed unattended build is only successful once its final
+            # database snapshot has been published to S3.
             with duckdb.connect(str(datasets[0].output)) as con:
-                s3_backup.maybe_upload(con, reason="successful build completion", force=True)
+                uploaded = s3_backup.maybe_upload(
+                    con,
+                    reason="successful build completion",
+                    force=True,
+                )
+
+            if not uploaded:
+                raise RuntimeError("Final S3 database upload failed")
     finally:
         progress.close()
 
