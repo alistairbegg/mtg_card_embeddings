@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -391,122 +392,6 @@ def upsert_draft_metadata(
                 )
 
 
-def clear_partial_draft_picks(
-    con: duckdb.DuckDBPyConnection,
-    draft_ids: set[str],
-) -> None:
-    frame = pd.DataFrame({"draft_id": sorted(draft_ids)})
-    con.register("_target_drafts", frame)
-    try:
-        con.execute(
-            "DELETE FROM draft_pick_cards WHERE pick_id IN ("
-            "SELECT p.pick_id FROM draft_picks p "
-            "JOIN _target_drafts d USING (draft_id))"
-        )
-        con.execute(
-            "DELETE FROM draft_picks WHERE draft_id IN "
-            "(SELECT draft_id FROM _target_drafts)"
-        )
-    finally:
-        con.unregister("_target_drafts")
-
-
-def clear_partial_replay_data(
-    con: duckdb.DuckDBPyConnection,
-    dataset_id: str,
-) -> None:
-    """Remove replay-derived rows only for drafts not yet fully checkpointed."""
-    game_filter = """
-        SELECT g.game_id
-        FROM games g
-        JOIN ingestion_draft_status s ON s.draft_id = g.draft_id
-        WHERE s.dataset_id = ? AND s.completed = FALSE
-    """
-    turn_filter = f"SELECT turn_id FROM turns WHERE game_id IN ({game_filter})"
-    hand_filter = f"SELECT hand_id FROM candidate_hands WHERE game_id IN ({game_filter})"
-
-    con.execute("BEGIN")
-    try:
-        con.execute(f"DELETE FROM events WHERE game_id IN ({game_filter})", [dataset_id])
-        con.execute(
-            f"DELETE FROM turn_player_state WHERE turn_id IN ({turn_filter})",
-            [dataset_id],
-        )
-        con.execute(
-            f"DELETE FROM turn_zone_cards WHERE turn_id IN ({turn_filter})",
-            [dataset_id],
-        )
-        con.execute(f"DELETE FROM turns WHERE game_id IN ({game_filter})", [dataset_id])
-        con.execute(
-            f"DELETE FROM candidate_hand_cards WHERE hand_id IN ({hand_filter})",
-            [dataset_id],
-        )
-        con.execute(
-            f"DELETE FROM candidate_hands WHERE game_id IN ({game_filter})",
-            [dataset_id],
-        )
-        con.execute(
-            f"DELETE FROM game_player_totals WHERE game_id IN ({game_filter})",
-            [dataset_id],
-        )
-        con.execute(
-            f"""
-            UPDATE game_players
-            SET n_games_bucket = NULL, game_win_rate_bucket = NULL
-            WHERE is_user = TRUE AND game_id IN ({game_filter})
-            """,
-            [dataset_id],
-        )
-        con.execute(
-            """
-            UPDATE ingestion_draft_status
-            SET replay_games_processed = 0
-            WHERE dataset_id = ? AND completed = FALSE
-            """,
-            [dataset_id],
-        )
-        con.execute("COMMIT")
-    except BaseException:
-        con.execute("ROLLBACK")
-        raise
-
-
-def clear_partial_game_data(
-    con: duckdb.DuckDBPyConnection,
-    dataset_id: str,
-) -> None:
-    """Remove normalized game data for only the uncheckpointed draft suffix."""
-    clear_partial_replay_data(con, dataset_id)
-    game_filter = """
-        SELECT g.game_id
-        FROM games g
-        JOIN ingestion_draft_status s ON s.draft_id = g.draft_id
-        WHERE s.dataset_id = ? AND s.completed = FALSE
-    """
-    build_filter = """
-        SELECT b.build_id
-        FROM deck_builds b
-        JOIN ingestion_draft_status s ON s.draft_id = b.draft_id
-        WHERE s.dataset_id = ? AND s.completed = FALSE
-    """
-    con.execute("BEGIN")
-    try:
-        con.execute(f"DELETE FROM game_card_stats WHERE game_id IN ({game_filter})", [dataset_id])
-        con.execute(f"DELETE FROM game_players WHERE game_id IN ({game_filter})", [dataset_id])
-        con.execute(f"DELETE FROM games WHERE game_id IN ({game_filter})", [dataset_id])
-        con.execute(
-            f"DELETE FROM deck_build_cards WHERE build_id IN ({build_filter})",
-            [dataset_id],
-        )
-        con.execute(
-            f"DELETE FROM deck_builds WHERE build_id IN ({build_filter})",
-            [dataset_id],
-        )
-        con.execute("COMMIT")
-    except BaseException:
-        con.execute("ROLLBACK")
-        raise
-
 
 @dataclass(frozen=True)
 class EventRule:
@@ -554,12 +439,12 @@ class DatabaseBuilder:
         paths: Paths,
         batch_size: int,
         overwrite: bool,
-        replay_progress_every: int,
+        progress_every: int,
     ) -> None:
         self.paths = paths
         self.batch_size = batch_size
         self.overwrite = overwrite
-        self.replay_progress_every = replay_progress_every
+        self.progress_every = progress_every
 
         self.draft_columns = read_header(paths.draft_file)
         self.game_columns = read_header(paths.game_file)
@@ -723,7 +608,14 @@ class DatabaseBuilder:
             con, "order", self.paths.game_file, game_signature
         )
         if phase.completed:
+            LOG.info("Index scan already complete.")
             return
+
+        started = time.monotonic()
+        LOG.info(
+            "Index scan: game_data starting at source row %s.",
+            f"{phase.next_source_row:,}",
+        )
 
         existing_rows = con.execute(
             """
@@ -800,6 +692,12 @@ class DatabaseBuilder:
             for row in reader:
                 if source_row < phase.next_source_row:
                     source_row += 1
+                    if self.progress_every > 0 and source_row % self.progress_every == 0:
+                        LOG.info(
+                            "Resume catch-up: %s/%s checkpointed source rows skipped.",
+                            f"{source_row:,}",
+                            f"{phase.next_source_row:,}",
+                        )
                     continue
                 draft_id = row[draft_position]
                 if draft_id not in draft_to_index:
@@ -819,9 +717,20 @@ class DatabaseBuilder:
                 rows_since_commit += 1
                 if rows_since_commit >= 50_000:
                     commit_progress(source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    LOG.info(
+                        "Index scan: %s game rows read; %s drafts found.",
+                        f"{source_row:,}",
+                        f"{len(draft_to_index):,}",
+                    )
 
         commit_progress(source_row, complete=True)
-        LOG.info("Indexed %d drafts from game_data in one pass.", len(draft_to_index))
+        LOG.info(
+            "Index scan complete: %s game rows; %s drafts; %.1fs.",
+            f"{source_row:,}",
+            f"{len(draft_to_index):,}",
+            time.monotonic() - started,
+        )
 
     def incomplete_draft_ids(self, con: duckdb.DuckDBPyConnection) -> set[str]:
         return {
@@ -846,9 +755,14 @@ class DatabaseBuilder:
             con, "draft", self.paths.draft_file, draft_signature
         )
         if phase.completed:
-            LOG.info("Draft source phase already complete.")
+            LOG.info("Phase 1/3 draft scan already complete.")
             return
 
+        started = time.monotonic()
+        LOG.info(
+            "Phase 1/3 draft scan: starting at source row %s.",
+            f"{phase.next_source_row:,}",
+        )
         target_draft_ids = self.incomplete_draft_ids(con)
         if not target_draft_ids:
             con.execute(
@@ -857,18 +771,6 @@ class DatabaseBuilder:
                 [self.paths.dataset_id],
             )
             return
-
-        # The old interleaved builder preloaded picks for an entire outer batch before
-        # advancing next_draft_index.  On first use of the single-pass builder, remove
-        # only those incomplete picks; fully checkpointed drafts are untouched.
-        if phase.next_source_row == 0:
-            con.execute("BEGIN")
-            try:
-                clear_partial_draft_picks(con, target_draft_ids)
-                con.execute("COMMIT")
-            except BaseException:
-                con.execute("ROLLBACK")
-                raise
 
         index = {column: position for position, column in enumerate(self.draft_columns)}
         pack_fields = [
@@ -901,20 +803,7 @@ class DatabaseBuilder:
                 if draft_rows:
                     upsert_draft_metadata(con, list(draft_rows.values()))
                 if pick_rows:
-                    insert_rows(
-                        con,
-                        "draft_picks",
-                        pick_rows,
-                        int64=("pick_id", "card_id"),
-                        int16=("pack_number", "pick_number"),
-                    )
-                    insert_rows(
-                        con,
-                        "draft_pick_cards",
-                        pick_card_rows,
-                        int64=("pick_id", "card_id"),
-                        int16=("pack_count", "pool_count"),
-                    )
+                    insert_or_validate_draft_rows(con, pick_rows, pick_card_rows)
                 con.execute(
                     """
                     UPDATE source_ingestion_checkpoints
@@ -947,6 +836,12 @@ class DatabaseBuilder:
             for row in reader:
                 if source_row < phase.next_source_row:
                     source_row += 1
+                    if self.progress_every > 0 and source_row % self.progress_every == 0:
+                        LOG.info(
+                            "Resume catch-up: %s/%s checkpointed source rows skipped.",
+                            f"{source_row:,}",
+                            f"{phase.next_source_row:,}",
+                        )
                     continue
                 source_row += 1
                 raw_since_commit += 1
@@ -1025,6 +920,12 @@ class DatabaseBuilder:
 
                 if len(pick_rows) >= commit_pick_limit:
                     commit_progress(source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    LOG.info(
+                        "Draft scan: %s rows read; %s relevant picks processed.",
+                        f"{source_row:,}",
+                        f"{total_picks + len(pick_rows):,}",
+                    )
 
         commit_progress(source_row, complete=True)
 
@@ -1040,7 +941,12 @@ class DatabaseBuilder:
         if missing:
             raise ValueError(f"Draft source completed but {missing} remaining drafts have no picks")
         con.execute("CHECKPOINT")
-        LOG.info("Draft source pass complete: imported %d picks.", total_picks)
+        LOG.info(
+            "Phase 1/3 draft scan complete: %s rows; %s relevant picks; %.1fs.",
+            f"{source_row:,}",
+            f"{total_picks:,}",
+            time.monotonic() - started,
+        )
 
     def build_game_player_rows_without_replay(
         self,
@@ -1084,13 +990,15 @@ class DatabaseBuilder:
             con, "game", self.paths.game_file, game_signature
         )
         if phase.completed:
-            LOG.info("Game source phase already complete.")
+            LOG.info("Phase 2/3 game scan already complete.")
             return
 
+        started = time.monotonic()
+        LOG.info(
+            "Phase 2/3 game scan: starting at source row %s.",
+            f"{phase.next_source_row:,}",
+        )
         target_draft_ids = self.incomplete_draft_ids(con)
-        if phase.next_source_row == 0:
-            clear_partial_game_data(con, self.paths.dataset_id)
-
         wanted_columns = self.game_usecols()
         index = {column: position for position, column in enumerate(self.game_columns)}
         wanted_indices = [index[column] for column in wanted_columns]
@@ -1168,6 +1076,12 @@ class DatabaseBuilder:
             for row in reader:
                 if source_row < phase.next_source_row:
                     source_row += 1
+                    if self.progress_every > 0 and source_row % self.progress_every == 0:
+                        LOG.info(
+                            "Resume catch-up: %s/%s checkpointed source rows skipped.",
+                            f"{source_row:,}",
+                            f"{phase.next_source_row:,}",
+                        )
                     continue
                 source_row += 1
                 raw_since_commit += 1
@@ -1175,6 +1089,12 @@ class DatabaseBuilder:
                     rows.append([row[position] for position in wanted_indices])
                 if len(rows) >= chunk_limit or raw_since_commit >= 50_000:
                     commit_progress(source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    LOG.info(
+                        "Game scan: %s rows read; %s relevant games processed.",
+                        f"{source_row:,}",
+                        f"{total_games + len(rows):,}",
+                    )
 
         commit_progress(source_row, complete=True)
 
@@ -1193,7 +1113,12 @@ class DatabaseBuilder:
         if mismatches:
             raise ValueError(f"Game source counts do not match draft index: {mismatches}")
         con.execute("CHECKPOINT")
-        LOG.info("Game source pass complete: imported %d games.", total_games)
+        LOG.info(
+            "Phase 2/3 game scan complete: %s rows; %s relevant games; %.1fs.",
+            f"{source_row:,}",
+            f"{total_games:,}",
+            time.monotonic() - started,
+        )
 
     def validate_replay_chunk_against_database(
         self,
@@ -1311,13 +1236,24 @@ class DatabaseBuilder:
             con, "replay", self.paths.replay_file, replay_signature
         )
         if phase.completed:
-            LOG.info("Replay source phase already complete.")
+            LOG.info("Phase 3/3 replay scan already complete.")
             return
 
-        target_draft_ids = self.incomplete_draft_ids(con)
-        if phase.next_source_row == 0:
-            clear_partial_replay_data(con, self.paths.dataset_id)
+        started = time.monotonic()
+        current_checkpoint = int(con.execute(
+            "SELECT next_draft_index FROM ingestion_checkpoints WHERE dataset_id = ?",
+            [self.paths.dataset_id],
+        ).fetchone()[0])
+        last_checkpoint_logged = current_checkpoint
+        LOG.info(
+            "Phase 3/3 replay scan: starting at source row %s; drafts complete %s/%s (%.1f%%).",
+            f"{phase.next_source_row:,}",
+            f"{current_checkpoint:,}",
+            f"{total_drafts:,}",
+            100.0 * current_checkpoint / total_drafts if total_drafts else 100.0,
+        )
 
+        target_draft_ids = self.incomplete_draft_ids(con)
         wanted_columns = self.replay_usecols()
         index = {column: position for position, column in enumerate(self.replay_columns)}
         missing_columns = [column for column in wanted_columns if column not in index]
@@ -1332,7 +1268,8 @@ class DatabaseBuilder:
         chunk_limit = max(50, self.batch_size)
 
         def commit_progress(next_source_row: int, complete: bool = False) -> None:
-            nonlocal total_replays, raw_since_commit
+            nonlocal total_replays, raw_since_commit, last_checkpoint_logged
+            checkpoint_after_commit: int | None = None
             if not rows and not complete and raw_since_commit < 50_000:
                 return
             replay_batch = pd.DataFrame(rows, columns=wanted_columns) if rows else None
@@ -1439,7 +1376,9 @@ class DatabaseBuilder:
                         """,
                         [self.paths.dataset_id],
                     )
-                    self.advance_main_checkpoint_from_status(con, total_drafts)
+                    checkpoint_after_commit = self.advance_main_checkpoint_from_status(
+                        con, total_drafts
+                    )
 
                 con.execute(
                     """
@@ -1462,6 +1401,17 @@ class DatabaseBuilder:
             total_replays += len(rows)
             rows.clear()
             raw_since_commit = 0
+            if (
+                checkpoint_after_commit is not None
+                and (checkpoint_after_commit - last_checkpoint_logged >= 500 or complete)
+            ):
+                LOG.info(
+                    "Checkpoint: %s/%s drafts complete (%.1f%%).",
+                    f"{checkpoint_after_commit:,}",
+                    f"{total_drafts:,}",
+                    100.0 * checkpoint_after_commit / total_drafts if total_drafts else 100.0,
+                )
+                last_checkpoint_logged = checkpoint_after_commit
 
         with open_csv_text(self.paths.replay_file) as handle:
             reader = csv.reader(handle)
@@ -1471,6 +1421,12 @@ class DatabaseBuilder:
             for row in reader:
                 if source_row < phase.next_source_row:
                     source_row += 1
+                    if self.progress_every > 0 and source_row % self.progress_every == 0:
+                        LOG.info(
+                            "Resume catch-up: %s/%s checkpointed source rows skipped.",
+                            f"{source_row:,}",
+                            f"{phase.next_source_row:,}",
+                        )
                     continue
                 source_row += 1
                 raw_since_commit += 1
@@ -1483,8 +1439,18 @@ class DatabaseBuilder:
                     rows.append([row[position] for position in wanted_indices])
                 if len(rows) >= chunk_limit or raw_since_commit >= 50_000:
                     commit_progress(source_row)
-                if self.replay_progress_every > 0 and source_row % self.replay_progress_every == 0:
-                    LOG.info("Replay source progress: %d rows scanned", source_row)
+                if self.progress_every > 0 and source_row % self.progress_every == 0:
+                    main_checkpoint = int(con.execute(
+                        "SELECT next_draft_index FROM ingestion_checkpoints WHERE dataset_id = ?",
+                        [self.paths.dataset_id],
+                    ).fetchone()[0])
+                    LOG.info(
+                        "Replay scan: %s rows read; %s relevant games processed; drafts %s/%s.",
+                        f"{source_row:,}",
+                        f"{total_replays + len(rows):,}",
+                        f"{main_checkpoint:,}",
+                        f"{total_drafts:,}",
+                    )
 
         commit_progress(source_row, complete=True)
 
@@ -1500,7 +1466,12 @@ class DatabaseBuilder:
         if missing:
             raise ValueError(f"Replay source completed before all games were found: {missing}")
         con.execute("CHECKPOINT")
-        LOG.info("Replay source pass complete: imported %d replay rows.", total_replays)
+        LOG.info(
+            "Phase 3/3 replay scan complete: %s rows; %s relevant games; %.1fs.",
+            f"{source_row:,}",
+            f"{total_replays:,}",
+            time.monotonic() - started,
+        )
 
     def sync_reference_tables(
         self,
@@ -1778,12 +1749,6 @@ class DatabaseBuilder:
             con.execute("ROLLBACK")
             raise
 
-        LOG.info(
-            "Draft %s committed: %d games; checkpoint draft index %d.",
-            draft_id,
-            len(game_batch),
-            checkpoint.next_draft_index + 1,
-        )
 
     def build_draft_rows(self, game_batch: pd.DataFrame) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
@@ -2914,6 +2879,98 @@ def insert_rows(
         con.unregister(temp_name)
 
 
+def insert_or_validate_draft_rows(
+    con: duckdb.DuckDBPyConnection,
+    pick_rows: list[dict[str, Any]],
+    pick_card_rows: list[dict[str, Any]],
+) -> None:
+    """Insert missing draft rows and verify any rows already present match source."""
+    if pick_rows:
+        pick_frame = rows_to_frame(
+            pick_rows,
+            int64=("pick_id", "card_id"),
+            int16=("pack_number", "pick_number"),
+        )
+        con.register("_draft_pick_chunk", pick_frame)
+        try:
+            mismatch = con.execute(
+                """
+                SELECT s.pick_id
+                FROM _draft_pick_chunk s
+                JOIN draft_picks p USING (pick_id)
+                WHERE p.draft_id IS DISTINCT FROM s.draft_id
+                   OR p.pack_number IS DISTINCT FROM s.pack_number
+                   OR p.pick_number IS DISTINCT FROM s.pick_number
+                   OR p.card_id IS DISTINCT FROM s.card_id
+                   OR CAST(p.pick_maindeck_rate AS REAL)
+                      IS DISTINCT FROM CAST(s.pick_maindeck_rate AS REAL)
+                   OR CAST(p.pick_sideboard_in_rate AS REAL)
+                      IS DISTINCT FROM CAST(s.pick_sideboard_in_rate AS REAL)
+                LIMIT 10
+                """
+            ).fetchall()
+            if mismatch:
+                raise ValueError(
+                    f"Existing draft_picks rows differ from source for pick IDs: "
+                    f"{[int(row[0]) for row in mismatch]}"
+                )
+            con.execute(
+                """
+                INSERT INTO draft_picks (
+                    pick_id, draft_id, pack_number, pick_number, card_id,
+                    pick_maindeck_rate, pick_sideboard_in_rate
+                )
+                SELECT
+                    s.pick_id, s.draft_id, s.pack_number, s.pick_number, s.card_id,
+                    s.pick_maindeck_rate, s.pick_sideboard_in_rate
+                FROM _draft_pick_chunk s
+                LEFT JOIN draft_picks p USING (pick_id)
+                WHERE p.pick_id IS NULL
+                """
+            )
+        finally:
+            con.unregister("_draft_pick_chunk")
+
+    if pick_card_rows:
+        card_frame = rows_to_frame(
+            pick_card_rows,
+            int64=("pick_id", "card_id"),
+            int16=("pack_count", "pool_count"),
+        )
+        con.register("_draft_pick_card_chunk", card_frame)
+        try:
+            mismatch = con.execute(
+                """
+                SELECT s.pick_id, s.card_id
+                FROM _draft_pick_card_chunk s
+                JOIN draft_pick_cards c
+                  ON c.pick_id = s.pick_id AND c.card_id = s.card_id
+                WHERE c.pack_count IS DISTINCT FROM s.pack_count
+                   OR c.pool_count IS DISTINCT FROM s.pool_count
+                LIMIT 10
+                """
+            ).fetchall()
+            if mismatch:
+                raise ValueError(
+                    "Existing draft_pick_cards rows differ from source for keys: "
+                    f"{[(int(a), int(b)) for a, b in mismatch]}"
+                )
+            con.execute(
+                """
+                INSERT INTO draft_pick_cards (
+                    pick_id, card_id, pack_count, pool_count
+                )
+                SELECT s.pick_id, s.card_id, s.pack_count, s.pool_count
+                FROM _draft_pick_card_chunk s
+                LEFT JOIN draft_pick_cards c
+                  ON c.pick_id = s.pick_id AND c.card_id = s.card_id
+                WHERE c.pick_id IS NULL
+                """
+            )
+        finally:
+            con.unregister("_draft_pick_card_chunk")
+
+
 def open_csv_text(path: Path):
     if path.suffix == ".gz":
         return gzip.open(path, "rt", encoding="utf-8", newline="")
@@ -3080,10 +3137,10 @@ def parse_args() -> argparse.Namespace:
         help="Base transaction chunk size. Source files are scanned once regardless of this value.",
     )
     parser.add_argument(
-        "--replay-progress-every",
+        "--progress-every",
         type=int,
-        default=500_000,
-        help="Log replay-scan progress every N rows; use 0 to disable.",
+        default=250_000,
+        help="Log source-scan progress every N rows for order/draft/game/replay; use 0 to disable.",
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
@@ -3109,7 +3166,7 @@ def main() -> None:
             paths=paths,
             batch_size=args.batch_size,
             overwrite=args.overwrite and index == 1,
-            replay_progress_every=args.replay_progress_every,
+            progress_every=args.progress_every,
         ).run()
 
 
