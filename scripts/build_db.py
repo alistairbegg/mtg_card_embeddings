@@ -395,6 +395,12 @@ def clear_partial_draft_picks(
     con: duckdb.DuckDBPyConnection,
     draft_ids: set[str],
 ) -> None:
+    """Delete incomplete draft-pick rows without tripping DuckDB FK indexes.
+
+    DuckDB can reject a parent DELETE when the child rows were deleted earlier in
+    the same transaction. Keep these as separate autocommit statements so the
+    draft_pick_cards deletion is committed before draft_picks is touched.
+    """
     frame = pd.DataFrame({"draft_id": sorted(draft_ids)})
     con.register("_target_drafts", frame)
     try:
@@ -862,13 +868,10 @@ class DatabaseBuilder:
         # advancing next_draft_index.  On first use of the single-pass builder, remove
         # only those incomplete picks; fully checkpointed drafts are untouched.
         if phase.next_source_row == 0:
-            con.execute("BEGIN")
-            try:
-                clear_partial_draft_picks(con, target_draft_ids)
-                con.execute("COMMIT")
-            except BaseException:
-                con.execute("ROLLBACK")
-                raise
+            # Keep child and parent deletes in separate autocommit statements.
+            # DuckDB can otherwise report the just-deleted child FK as still
+            # referencing draft_picks within the same transaction.
+            clear_partial_draft_picks(con, target_draft_ids)
 
         index = {column: position for position, column in enumerate(self.draft_columns)}
         pack_fields = [
