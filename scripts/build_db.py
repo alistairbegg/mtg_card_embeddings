@@ -9,6 +9,10 @@ replay-derived hands, turns, states, zones and events in one replay_data pass.
 The existing next_draft_index checkpoint remains authoritative, so databases created by
 the previous draft-batched builder can resume without rebuilding completed drafts.
 Additional source-phase checkpoints make the single-pass scans resumable after failure.
+Wide draft rows use a small quote-aware metadata-prefix parser followed by NumPy's
+compiled fromstring parser for the ~1,090 numeric pack/pool fields, avoiding per-card
+Python parsing; other wide CSV rows use a C-level split fast path whenever quoting is
+absent. Replay turn IDs are hashed once per active turn and reused across child tables.
 
 The database preserves source truth rather than reconstructing ambiguous chronology.
 The N in user_turn_N / oppo_turn_N is stored as source_turn_index. Every event keeps
@@ -28,7 +32,9 @@ import io
 import json
 import logging
 import re
+import subprocess
 import time
+from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +45,13 @@ import numpy as np
 import pandas as pd
 
 LOG = logging.getLogger("17lands-db")
+
+S3_BUCKET = "alistairbegg-personal-projects"
+S3_PREFIX = "mtg_card_embeddings/data"
+S3_REGION = "eu-west-2"
+S3_DATABASE_KEY = f"{S3_PREFIX}/17lands.duckdb"
+S3_MANIFEST_KEY = f"{S3_PREFIX}/manifest.json"
+S3_HASH_CHUNK_SIZE = 8 * 1024 * 1024
 GAME_KEY = ("draft_id", "match_number", "game_number")
 TURN_RE = re.compile(r"^(user|oppo)_turn_(\d+)_(.+)$")
 GAME_CARD_PREFIXES = ("opening_hand", "drawn", "tutored", "deck", "sideboard")
@@ -363,50 +376,138 @@ def source_count(value: str) -> int:
 
 
 def csv_field_at(record: str, target_index: int) -> str:
-    """Extract one CSV field without parsing the rest of a very wide record.
+    """Extract a field while avoiding a full parse of a wide record.
 
-    draft_id is near the front of the 17Lands files, so this avoids constructing
-    ~1,000 Python strings merely to decide whether a source row is relevant.
+    17Lands puts draft_id at/near the front. The common path therefore stays in
+    CPython's C string routines and is effectively independent of record width.
+    A quote-aware parser is used only if a quoted field occurs before the target.
     """
-    field_index = 0
-    in_quotes = False
-    chars: list[str] | None = [] if target_index == 0 else None
-    i = 0
-    n = len(record)
-    while i < n:
-        ch = record[i]
-        if ch == '"':
-            if in_quotes and i + 1 < n and record[i + 1] == '"':
-                if chars is not None:
-                    chars.append('"')
-                i += 2
-                continue
-            in_quotes = not in_quotes
-            i += 1
-            continue
-        if ch == ',' and not in_quotes:
+    if target_index == 0:
+        head, sep, _tail = record.partition(",")
+        if not sep:
+            return head.rstrip("\r\n")
+        if '"' not in head:
+            return head
+
+    start = 0
+    for field_index in range(target_index + 1):
+        comma = record.find(",", start)
+        end = len(record) if comma < 0 else comma
+        candidate = record[start:end]
+        # If no quote has appeared in the prefix, normal comma positions are safe.
+        if '"' not in record[:end]:
             if field_index == target_index:
-                return ''.join(chars or ())
-            field_index += 1
-            chars = [] if field_index == target_index else None
-            i += 1
+                return candidate.rstrip("\r\n")
+            start = end + 1
             continue
-        if chars is not None and ch not in '\r\n':
-            chars.append(ch)
-        i += 1
-    if field_index == target_index:
-        return ''.join(chars or ())
-    raise ValueError(f"CSV record has no field at index {target_index}")
+        break
+
+    # Rare fallback for quoted commas before the requested field.
+    return next(csv.reader([record]))[target_index]
 
 
 def parse_csv_record(record: str, expected_columns: int, source_name: str, source_row: int) -> list[str]:
-    row = next(csv.reader([record]))
+    # Most 17Lands data rows contain no CSV quoting. str.split is implemented in C
+    # and is substantially faster than csv.reader for ~1,000-column records.
+    if '"' not in record:
+        row = record.rstrip("\r\n").split(",")
+    else:
+        row = next(csv.reader([record]))
     if len(row) != expected_columns:
         raise ValueError(
             f"Malformed {source_name} CSV row {source_row}: {len(row)} fields, "
             f"expected {expected_columns}"
         )
     return row
+
+
+def contiguous_span(fields: list[tuple[int, int]]) -> tuple[int, int, np.ndarray] | None:
+    """Return [start, stop) and aligned card IDs when source positions are contiguous."""
+    if not fields:
+        return None
+    positions = [position for position, _card_id in fields]
+    start = positions[0]
+    stop = start + len(positions)
+    if positions != list(range(start, stop)):
+        return None
+    return start, stop, np.asarray([card_id for _position, card_id in fields], dtype=np.int64)
+
+
+def count_vector(values: list[str]) -> np.ndarray:
+    """Convert a dense run of draft count strings in compiled NumPy code.
+
+    Normal 17Lands draft count fields are integer strings. A tolerant fallback
+    preserves the old parser for unusual blanks/float spellings.
+    """
+    try:
+        return np.asarray(values, dtype=np.int16)
+    except (TypeError, ValueError):
+        return np.fromiter((source_count(value) for value in values), dtype=np.int16, count=len(values))
+
+
+def split_csv_prefix(record: str, field_count: int) -> tuple[list[str], str]:
+    """Parse exactly field_count CSV fields and return the untouched tail.
+
+    This is designed for draft_data where a small metadata prefix is followed by
+    ~1,090 numeric count fields. The common no-quote prefix uses str.split in C;
+    the quote-aware fallback scans only the short metadata prefix, not the tail.
+    """
+    if field_count <= 0:
+        return [], record.rstrip("\r\n")
+
+    parts = record.split(",", field_count)
+    if len(parts) == field_count + 1 and not any('"' in part for part in parts[:field_count]):
+        return parts[:field_count], parts[field_count].rstrip("\r\n")
+
+    fields: list[str] = []
+    chars: list[str] = []
+    in_quotes = False
+    i = 0
+    n = len(record)
+    while i < n and len(fields) < field_count:
+        ch = record[i]
+        if ch == '"':
+            if in_quotes and i + 1 < n and record[i + 1] == '"':
+                chars.append('"')
+                i += 2
+                continue
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        if ch == "," and not in_quotes:
+            fields.append("".join(chars))
+            chars.clear()
+            i += 1
+            continue
+        if ch not in "\r\n":
+            chars.append(ch)
+        i += 1
+
+    if len(fields) != field_count:
+        raise ValueError(f"CSV record ended before {field_count} prefix fields were parsed")
+    return fields, record[i:].rstrip("\r\n")
+
+
+def numeric_csv_tail(tail: str, expected_count: int) -> np.ndarray | None:
+    """Parse a comma-separated numeric tail in NumPy/C, returning int16 counts.
+
+    None means the row used an unusual spelling (for example an empty count) and
+    should take the fully tolerant CSV fallback.
+    """
+    if expected_count == 0:
+        return np.empty(0, dtype=np.int16)
+    try:
+        values = np.fromstring(tail, sep=",", dtype=np.float32)
+    except ValueError:
+        return None
+    if len(values) != expected_count:
+        return None
+    if not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values > np.iinfo(np.int16).max):
+        return None
+    rounded = values.astype(np.int16)
+    if not np.all(values == rounded):
+        return None
+    return rounded
 
 
 def skip_checkpointed_records(
@@ -551,6 +652,126 @@ class SourceCheckpoint:
     completed: bool
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(S3_HASH_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+class S3BackupManager:
+    """Periodically upload committed DuckDB snapshots when explicitly enabled.
+
+    Uploads are synchronous and are only attempted after a source chunk has committed.
+    The active DuckDB connection is checkpointed before the file is read, so the uploaded
+    .duckdb object is a self-contained snapshot. No boto3 import, AWS credential lookup,
+    checkpoint-for-upload, checksum, or network call occurs when this manager is absent.
+    """
+
+    def __init__(self, db_path: Path, interval_minutes: float) -> None:
+        if interval_minutes <= 0:
+            raise ValueError("--s3-backup-every-minutes must be positive")
+        self.db_path = db_path
+        self.interval_seconds = interval_minutes * 60.0
+        self.last_upload_monotonic = time.monotonic()
+        self.last_attempt_monotonic = 0.0
+        self.s3 = None
+
+    def _client(self):
+        if self.s3 is None:
+            try:
+                import boto3
+                from botocore.config import Config
+            except ImportError as exc:
+                raise RuntimeError(
+                    "S3 backups require boto3/botocore. Install them or omit "
+                    "--s3-backup-every-minutes."
+                ) from exc
+            session = boto3.Session()
+            self.s3 = session.client(
+                "s3",
+                region_name=S3_REGION,
+                config=Config(signature_version="s3v4"),
+            )
+        return self.s3
+
+    def _manifest(self) -> dict[str, Any]:
+        return {
+            "database": self.db_path.name,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "size_bytes": self.db_path.stat().st_size,
+            "sha256": sha256_file(self.db_path),
+            "git_commit": get_git_commit(),
+        }
+
+    def maybe_upload(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        *,
+        reason: str,
+        force: bool = False,
+    ) -> bool:
+        now = time.monotonic()
+        if not force and now - self.last_upload_monotonic < self.interval_seconds:
+            return False
+
+        # If AWS is temporarily unavailable, avoid retrying on every tiny DB commit.
+        retry_floor = min(self.interval_seconds, 300.0)
+        if not force and self.last_attempt_monotonic and now - self.last_attempt_monotonic < retry_floor:
+            return False
+        self.last_attempt_monotonic = now
+
+        started = time.monotonic()
+        LOG.info(
+            "S3 backup due (%s): checkpointing %s before upload.",
+            reason,
+            self.db_path,
+        )
+        try:
+            con.execute("CHECKPOINT")
+            manifest = self._manifest()
+            s3 = self._client()
+            LOG.info(
+                "S3 backup: uploading %s bytes to s3://%s/%s.",
+                f"{manifest['size_bytes']:,}",
+                S3_BUCKET,
+                S3_DATABASE_KEY,
+            )
+            s3.upload_file(str(self.db_path), S3_BUCKET, S3_DATABASE_KEY)
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=S3_MANIFEST_KEY,
+                Body=json.dumps(manifest, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception:
+            LOG.exception(
+                "S3 backup failed; ingestion will continue and retry after a later commit."
+            )
+            return False
+
+        self.last_upload_monotonic = time.monotonic()
+        LOG.info(
+            "S3 backup complete in %.1fs: s3://%s/%s",
+            time.monotonic() - started,
+            S3_BUCKET,
+            S3_DATABASE_KEY,
+        )
+        return True
+
+
 class DatabaseBuilder:
     def __init__(
         self,
@@ -558,11 +779,13 @@ class DatabaseBuilder:
         batch_size: int,
         overwrite: bool,
         progress_every: int,
+        s3_backup: S3BackupManager | None = None,
     ) -> None:
         self.paths = paths
         self.batch_size = batch_size
         self.overwrite = overwrite
         self.progress_every = progress_every
+        self.s3_backup = s3_backup
 
         self.draft_columns = read_header(paths.draft_file)
         self.game_columns = read_header(paths.game_file)
@@ -656,6 +879,10 @@ class DatabaseBuilder:
             self.run_integrity_checks(con)
         finally:
             con.close()
+
+    def maybe_s3_backup(self, con: duckdb.DuckDBPyConnection, reason: str) -> None:
+        if self.s3_backup is not None:
+            self.s3_backup.maybe_upload(con, reason=reason)
 
     def game_usecols(self) -> list[str]:
         wanted = set(GAME_METADATA_COLUMNS)
@@ -790,6 +1017,7 @@ class DatabaseBuilder:
             except BaseException:
                 con.execute("ROLLBACK")
                 raise
+            self.maybe_s3_backup(con, "index scan checkpoint")
             pending_new = []
             pending_counts = Counter()
             rows_since_commit = 0
@@ -882,7 +1110,52 @@ class DatabaseBuilder:
             (index[column], self.reference.card_name_to_id[name])
             for column, name in self.draft_pool_columns.items()
         ]
+        pack_span = contiguous_span(pack_fields)
+        pool_span = contiguous_span(pool_fields)
         pack_position_by_card_id = {card_id: position for position, card_id in pack_fields}
+
+        # The 17Lands draft export has a compact metadata prefix followed by all
+        # pack_card_* and pool_* count columns. If that invariant holds, parse the
+        # entire numeric tail with np.fromstring instead of constructing ~1,090
+        # Python strings and visiting each field in Python.
+        card_positions = sorted(position for position, _card_id in (*pack_fields, *pool_fields))
+        draft_tail_start: int | None = None
+        draft_tail_count = 0
+        if card_positions:
+            candidate_start = card_positions[0]
+            if (
+                card_positions == list(range(candidate_start, len(self.draft_columns)))
+                and len(card_positions) == len(self.draft_columns) - candidate_start
+            ):
+                draft_tail_start = candidate_start
+                draft_tail_count = len(card_positions)
+
+        if draft_tail_start is not None:
+            LOG.info(
+                "Draft scan turbo path: %s metadata fields + %s numeric count fields.",
+                f"{draft_tail_start:,}", f"{draft_tail_count:,}",
+            )
+        elif pack_span is not None and pool_span is not None:
+            LOG.info(
+                "Draft scan vectorization: pack=%s contiguous columns; pool=%s contiguous columns.",
+                f"{len(pack_fields):,}", f"{len(pool_fields):,}",
+            )
+        else:
+            LOG.warning("Draft card columns are not contiguous; using slower sparse fallback.")
+
+        pack_offsets_from_tail = None
+        pool_offsets_from_tail = None
+        pack_card_ids_tail = None
+        pool_card_ids_tail = None
+        if draft_tail_start is not None:
+            pack_offsets_from_tail = np.asarray(
+                [position - draft_tail_start for position, _card_id in pack_fields], dtype=np.int32
+            )
+            pool_offsets_from_tail = np.asarray(
+                [position - draft_tail_start for position, _card_id in pool_fields], dtype=np.int32
+            )
+            pack_card_ids_tail = np.asarray([card_id for _position, card_id in pack_fields], dtype=np.int64)
+            pool_card_ids_tail = np.asarray([card_id for _position, card_id in pool_fields], dtype=np.int64)
 
         metadata_columns = (
             "expansion", "event_type", "draft_time", "rank", "event_match_wins",
@@ -892,12 +1165,12 @@ class DatabaseBuilder:
         seen_metadata_raw: dict[str, tuple[str | None, ...]] = {}
 
         draft_rows: dict[str, dict[str, Any]] = {}
-        pick_rows: list[dict[str, Any]] = []
-        pick_card_rows: list[dict[str, Any]] = []
+        pick_rows: list[tuple[int, str, int, int, int, float | None, float | None]] = []
+        pick_card_rows: list[tuple[int, int, int, int]] = []
         source_row = phase.next_source_row
         raw_since_commit = 0
         total_picks = 0
-        commit_pick_limit = max(5_000, self.batch_size * 10)
+        commit_pick_limit = max(10_000, self.batch_size * 10)
 
         def commit_progress(next_source_row: int, complete: bool = False) -> None:
             nonlocal total_picks, raw_since_commit
@@ -922,6 +1195,7 @@ class DatabaseBuilder:
             except BaseException:
                 con.execute("ROLLBACK")
                 raise
+            self.maybe_s3_backup(con, "draft scan checkpoint")
             total_picks += len(pick_rows)
             draft_rows.clear()
             pick_rows.clear()
@@ -944,10 +1218,29 @@ class DatabaseBuilder:
                         commit_progress(source_row)
                     continue
 
-                row = parse_csv_record(record, len(self.draft_columns), "draft", source_row)
+                tail_counts: np.ndarray | None = None
+                if draft_tail_start is not None:
+                    prefix, numeric_tail = split_csv_prefix(record, draft_tail_start)
+                    tail_counts = numeric_csv_tail(numeric_tail, draft_tail_count)
+                    if tail_counts is not None:
+                        # Prefix positions are identical to source positions because the
+                        # numeric tail starts exactly at draft_tail_start.
+                        row = prefix
+                    else:
+                        row = parse_csv_record(record, len(self.draft_columns), "draft", source_row)
+                else:
+                    row = parse_csv_record(record, len(self.draft_columns), "draft", source_row)
+
+                def draft_value(position: int | None) -> str | None:
+                    if position is None:
+                        return None
+                    if position < len(row):
+                        return row[position]
+                    # This only occurs on the tolerant full-row fallback.
+                    return row[position]
 
                 metadata_raw = tuple(
-                    None if position is None else row[position]
+                    draft_value(position)
                     for position in metadata_positions.values()
                 )
                 previous_raw = seen_metadata_raw.get(draft_id)
@@ -965,7 +1258,6 @@ class DatabaseBuilder:
                         "user_game_win_rate_bucket": numeric_or_none(metadata_raw[7]),
                     }
                 elif metadata_raw != previous_raw:
-                    # Rare slow path: preserve the original tolerant comparison semantics.
                     parsed = (
                         text_or_none(metadata_raw[0]), text_or_none(metadata_raw[1]),
                         timestamp_or_none(metadata_raw[2]), text_or_none(metadata_raw[3]),
@@ -981,59 +1273,98 @@ class DatabaseBuilder:
                     if not values_equal(prior, parsed):
                         raise ValueError(f"Conflicting draft metadata within draft {draft_id}")
 
-                pack_number = parse_key_integer(row[index["pack_number"]])
-                pick_number = parse_key_integer(row[index["pick_number"]])
-                picked_name = normalize_card_name(row[index["pick"]])
+                pack_number = parse_key_integer(draft_value(index["pack_number"]))
+                pick_number = parse_key_integer(draft_value(index["pick_number"]))
+                picked_name = normalize_card_name(draft_value(index["pick"]))
                 picked_id = self.reference.card_name_to_id[picked_name]
                 pick_id = make_pick_id(draft_id, pack_number, pick_number)
 
                 offered_position = pack_position_by_card_id.get(picked_id)
-                if offered_position is None or source_count(row[offered_position]) <= 0:
+                if offered_position is None:
                     raise ValueError(
-                        f"Selected card {picked_name!r} not offered for {draft_id} "
-                        f"pack={pack_number} pick={pick_number}"
+                        f"Selected card {picked_name!r} has no offered-pack column for {draft_id}"
                     )
 
                 card_counts: dict[int, list[int]] = {}
-                for position, card_id in pack_fields:
-                    raw = row[position]
-                    if raw == "0" or raw == "" or raw == "0.0":
-                        continue
-                    count = source_count(raw)
-                    if count:
-                        card_counts[card_id] = [count, 0]
-                for position, card_id in pool_fields:
-                    raw = row[position]
-                    if raw == "0" or raw == "" or raw == "0.0":
-                        continue
-                    count = source_count(raw)
-                    if count:
+                if tail_counts is not None:
+                    assert draft_tail_start is not None
+                    assert pack_offsets_from_tail is not None and pool_offsets_from_tail is not None
+                    assert pack_card_ids_tail is not None and pool_card_ids_tail is not None
+                    pack_counts = tail_counts[pack_offsets_from_tail]
+                    pool_counts = tail_counts[pool_offsets_from_tail]
+                    offered_offset = offered_position - draft_tail_start
+                    if offered_offset < 0 or offered_offset >= len(tail_counts) or int(tail_counts[offered_offset]) <= 0:
+                        raise ValueError(
+                            f"Selected card {picked_name!r} not offered for {draft_id} "
+                            f"pack={pack_number} pick={pick_number}"
+                        )
+                    for offset_raw in np.flatnonzero(pack_counts):
+                        offset = int(offset_raw)
+                        card_counts[int(pack_card_ids_tail[offset])] = [int(pack_counts[offset]), 0]
+                    for offset_raw in np.flatnonzero(pool_counts):
+                        offset = int(offset_raw)
+                        card_id = int(pool_card_ids_tail[offset])
+                        count = int(pool_counts[offset])
                         counts = card_counts.get(card_id)
                         if counts is None:
                             card_counts[card_id] = [0, count]
                         else:
                             counts[1] = count
+                elif len(row) == len(self.draft_columns) and pack_span is not None and pool_span is not None:
+                    pack_start, pack_stop, pack_card_ids = pack_span
+                    pool_start, pool_stop, pool_card_ids = pool_span
+                    pack_counts = count_vector(row[pack_start:pack_stop])
+                    pool_counts = count_vector(row[pool_start:pool_stop])
+                    offered_offset = offered_position - pack_start
+                    if offered_offset < 0 or offered_offset >= len(pack_counts) or int(pack_counts[offered_offset]) <= 0:
+                        raise ValueError(
+                            f"Selected card {picked_name!r} not offered for {draft_id} "
+                            f"pack={pack_number} pick={pick_number}"
+                        )
+                    for offset_raw in np.flatnonzero(pack_counts):
+                        offset = int(offset_raw)
+                        card_counts[int(pack_card_ids[offset])] = [int(pack_counts[offset]), 0]
+                    for offset_raw in np.flatnonzero(pool_counts):
+                        offset = int(offset_raw)
+                        card_id = int(pool_card_ids[offset])
+                        count = int(pool_counts[offset])
+                        counts = card_counts.get(card_id)
+                        if counts is None:
+                            card_counts[card_id] = [0, count]
+                        else:
+                            counts[1] = count
+                else:
+                    if source_count(row[offered_position]) <= 0:
+                        raise ValueError(
+                            f"Selected card {picked_name!r} not offered for {draft_id} "
+                            f"pack={pack_number} pick={pick_number}"
+                        )
+                    for position, card_id in pack_fields:
+                        count = source_count(row[position])
+                        if count:
+                            card_counts[card_id] = [count, 0]
+                    for position, card_id in pool_fields:
+                        count = source_count(row[position])
+                        if count:
+                            counts = card_counts.get(card_id)
+                            if counts is None:
+                                card_counts[card_id] = [0, count]
+                            else:
+                                counts[1] = count
 
-                pick_rows.append({
-                    "pick_id": pick_id,
-                    "draft_id": draft_id,
-                    "pack_number": pack_number,
-                    "pick_number": pick_number,
-                    "card_id": picked_id,
-                    "pick_maindeck_rate": numeric_or_none(
-                        row[index["pick_maindeck_rate"]]
-                    ) if "pick_maindeck_rate" in index else None,
-                    "pick_sideboard_in_rate": numeric_or_none(
-                        row[index["pick_sideboard_in_rate"]]
-                    ) if "pick_sideboard_in_rate" in index else None,
-                })
+                pick_rows.append((
+                    pick_id,
+                    draft_id,
+                    pack_number,
+                    pick_number,
+                    picked_id,
+                    numeric_or_none(draft_value(index["pick_maindeck_rate"]))
+                    if "pick_maindeck_rate" in index else None,
+                    numeric_or_none(draft_value(index["pick_sideboard_in_rate"]))
+                    if "pick_sideboard_in_rate" in index else None,
+                ))
                 pick_card_rows.extend(
-                    {
-                        "pick_id": pick_id,
-                        "card_id": card_id,
-                        "pack_count": counts[0],
-                        "pool_count": counts[1],
-                    }
+                    (pick_id, card_id, counts[0], counts[1])
                     for card_id, counts in card_counts.items()
                 )
 
@@ -1128,7 +1459,7 @@ class DatabaseBuilder:
         source_row = phase.next_source_row
         raw_since_commit = 0
         total_games = 0
-        chunk_limit = max(2_500, self.batch_size * 5)
+        chunk_limit = max(5_000, self.batch_size * 5)
 
         def commit_progress(next_source_row: int, complete: bool = False) -> None:
             nonlocal total_games, raw_since_commit
@@ -1180,6 +1511,7 @@ class DatabaseBuilder:
             except BaseException:
                 con.execute("ROLLBACK")
                 raise
+            self.maybe_s3_backup(con, "game scan checkpoint")
             total_games += len(rows)
             rows.clear()
             raw_since_commit = 0
@@ -1398,7 +1730,7 @@ class DatabaseBuilder:
         source_row = phase.next_source_row
         raw_since_commit = 0
         total_replays = 0
-        chunk_limit = max(500, self.batch_size)
+        chunk_limit = max(1_000, self.batch_size)
 
         def commit_progress(next_source_row: int, complete: bool = False) -> None:
             nonlocal total_replays, raw_since_commit, current_checkpoint, last_checkpoint_logged
@@ -1416,13 +1748,14 @@ class DatabaseBuilder:
 
                     positions_by_column = self.turn_meaningful_positions(replay_batch)
                     active_turns = self.find_turns(replay_batch, game_ids, positions_by_column)
-                    turn_rows = self.build_turn_rows(active_turns)
+                    turn_id_map = self.make_turn_id_map(active_turns)
+                    turn_rows = self.build_turn_rows(active_turns, turn_id_map)
                     event_rows = self.build_event_rows(
-                        replay_batch, game_ids, positions_by_column
+                        replay_batch, game_ids, positions_by_column, turn_id_map
                     )
                     hand_rows, hand_card_rows = self.build_candidate_hand_rows(replay_batch, game_ids)
                     state_rows, zone_rows = self.build_turn_state_and_zones(
-                        replay_batch, game_ids, active_turns
+                        replay_batch, game_ids, active_turns, turn_id_map
                     )
                     total_rows = self.build_total_rows(replay_batch, game_ids)
                     validate_batch_rows(
@@ -1516,6 +1849,7 @@ class DatabaseBuilder:
             except BaseException:
                 con.execute("ROLLBACK")
                 raise
+            self.maybe_s3_backup(con, "replay scan checkpoint")
 
             total_replays += len(rows)
             rows.clear()
@@ -2100,13 +2434,25 @@ class DatabaseBuilder:
                 active.add((game_ids[int(position)], source_side, source_turn_index))
         return active
 
+    def make_turn_id_map(
+        self,
+        active: set[tuple[int, str, int]],
+    ) -> dict[tuple[int, str, int], int]:
+        # turn_id is reused by the turn row, events, states and zones. Hash it once.
+        return {
+            key: make_turn_id(*key)
+            for key in active
+        }
+
     def build_turn_rows(
         self,
         active: set[tuple[int, str, int]],
+        turn_id_map: dict[tuple[int, str, int], int] | None = None,
     ) -> list[dict[str, Any]]:
+        turn_id_map = turn_id_map or self.make_turn_id_map(active)
         return [
             {
-                "turn_id": make_turn_id(game_id, source_side, source_turn_index),
+                "turn_id": turn_id_map[(game_id, source_side, source_turn_index)],
                 "game_id": game_id,
                 "is_user_turn": source_side == "user",
                 "source_turn_index": source_turn_index,
@@ -2119,10 +2465,14 @@ class DatabaseBuilder:
         replay_batch: pd.DataFrame,
         game_ids: list[int],
         positions_by_column: dict[str, np.ndarray] | None = None,
+        turn_id_map: dict[tuple[int, str, int], int] | None = None,
     ) -> list[dict[str, Any]]:
         assert self.reference is not None
         rows: list[dict[str, Any]] = []
         positions_by_column = positions_by_column or self.turn_meaningful_positions(replay_batch)
+        turn_id_map = turn_id_map or self.make_turn_id_map(
+            self.find_turns(replay_batch, game_ids, positions_by_column)
+        )
         for column, rule in self.event_columns.items():
             positions = positions_by_column.get(column)
             if positions is None:
@@ -2135,7 +2485,7 @@ class DatabaseBuilder:
                 position = int(position_raw)
                 game_id = game_ids[position]
                 value = values[position]
-                source_turn_id = make_turn_id(game_id, source_side, source_turn_index)
+                source_turn_id = turn_id_map[(game_id, source_side, source_turn_index)]
                 actual_turn_id = source_turn_id if rule.exact_turn else None
                 if rule.payload == "card":
                     for ordinal, token in enumerate(split_ids(value), start=1):
@@ -2211,9 +2561,11 @@ class DatabaseBuilder:
         replay_batch: pd.DataFrame,
         game_ids: list[int],
         active_turns: set[tuple[int, str, int]],
+        turn_id_map: dict[tuple[int, str, int], int] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         assert self.reference is not None
         positions = {game_id: position for position, game_id in enumerate(game_ids)}
+        turn_id_map = turn_id_map or self.make_turn_id_map(active_turns)
         arrays = {column: replay_batch[column].to_numpy(copy=False) for column in replay_batch.columns}
         state_rows: list[dict[str, Any]] = []
         zone_rows: list[dict[str, Any]] = []
@@ -2224,7 +2576,7 @@ class DatabaseBuilder:
 
         for game_id, source_side, source_turn_index in sorted(active_turns):
             position = positions[game_id]
-            turn_id = make_turn_id(game_id, source_side, source_turn_index)
+            turn_id = turn_id_map[(game_id, source_side, source_turn_index)]
             stem = f"{source_side}_turn_{source_turn_index}_"
             for player_is_user, player in ((True, "user"), (False, "oppo")):
                 life = numeric_or_none(raw(f"{stem}eot_{player}_life", position))
@@ -2763,20 +3115,36 @@ def make_event_id(game_id: int, source_field: str, source_ordinal: int) -> int:
 
 
 def split_ids(value: Any) -> list[str]:
-    if is_missing_or_blank(value):
+    if value is None:
         return []
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "<na>"}:
+    if isinstance(value, str):
+        if value == "":
+            return []
+        # Replay ID lists are normally already canonical integer strings separated
+        # by pipes. Avoid strip/lower/list filtering on that common path.
+        if " " not in value and "\t" not in value and value not in {"nan", "none", "<na>"}:
+            return value.split("|")
+        text = value.strip()
+    else:
+        if is_missing_or_blank(value):
+            return []
+        text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>"}:
         return []
     return [token.strip() for token in text.split("|") if token.strip()]
 
 
 def parse_source_id(token: Any) -> int:
-    text = str(token).strip()
+    if isinstance(token, str):
+        try:
+            return int(token)
+        except ValueError:
+            text = token.strip()
+            return int(float(text))
     try:
-        return int(text)
-    except ValueError:
-        return int(float(text))
+        return int(token)
+    except (TypeError, ValueError):
+        return int(float(token))
 
 
 def parse_key_integer(value: str) -> int:
@@ -2947,16 +3315,27 @@ def insert_rows(
 
 def insert_or_validate_draft_rows(
     con: duckdb.DuckDBPyConnection,
-    pick_rows: list[dict[str, Any]],
-    pick_card_rows: list[dict[str, Any]],
+    pick_rows: list[tuple[int, str, int, int, int, float | None, float | None]],
+    pick_card_rows: list[tuple[int, int, int, int]],
 ) -> None:
-    """Insert missing draft rows and verify any rows already present match source."""
+    """Insert missing draft rows and verify any rows already present match source.
+
+    Draft ingestion uses tuples rather than one Python dict per normalized row. This
+    matters for draft_pick_cards, where a 10k-pick chunk can contain hundreds of
+    thousands of child rows.
+    """
     if pick_rows:
-        pick_frame = rows_to_frame(
+        pick_frame = pd.DataFrame.from_records(
             pick_rows,
-            int64=("pick_id", "card_id"),
-            int16=("pack_number", "pick_number"),
+            columns=(
+                "pick_id", "draft_id", "pack_number", "pick_number", "card_id",
+                "pick_maindeck_rate", "pick_sideboard_in_rate",
+            ),
         )
+        pick_frame["pick_id"] = pick_frame["pick_id"].astype("int64")
+        pick_frame["card_id"] = pick_frame["card_id"].astype("int64")
+        pick_frame["pack_number"] = pick_frame["pack_number"].astype("int16")
+        pick_frame["pick_number"] = pick_frame["pick_number"].astype("int16")
         con.register("_draft_pick_chunk", pick_frame)
         try:
             mismatch = con.execute(
@@ -2998,11 +3377,14 @@ def insert_or_validate_draft_rows(
             con.unregister("_draft_pick_chunk")
 
     if pick_card_rows:
-        card_frame = rows_to_frame(
+        card_frame = pd.DataFrame.from_records(
             pick_card_rows,
-            int64=("pick_id", "card_id"),
-            int16=("pack_count", "pool_count"),
+            columns=("pick_id", "card_id", "pack_count", "pool_count"),
         )
+        card_frame["pick_id"] = card_frame["pick_id"].astype("int64")
+        card_frame["card_id"] = card_frame["card_id"].astype("int64")
+        card_frame["pack_count"] = card_frame["pack_count"].astype("int16")
+        card_frame["pool_count"] = card_frame["pool_count"].astype("int16")
         con.register("_draft_pick_card_chunk", card_frame)
         try:
             mismatch = con.execute(
@@ -3202,7 +3584,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=500,
+        default=1000,
         help="Base transaction chunk size. Source files are scanned once regardless of this value.",
     )
     parser.add_argument(
@@ -3210,6 +3592,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=250_000,
         help="Log source-scan progress every N rows for order/draft/game/replay; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--s3-backup-every-minutes",
+        type=float,
+        metavar="MINUTES",
+        help=(
+            "Opt in to periodic S3 snapshots. After committed chunks, upload at most once "
+            "per MINUTES to s3://alistairbegg-personal-projects/mtg_card_embeddings/data/. "
+            "A final snapshot is also uploaded after a successful build. Omit this option "
+            "to disable all S3 backup activity."
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
@@ -3226,6 +3619,19 @@ def main() -> None:
     LOG.info("Output: %s", datasets[0].output)
     LOG.info("Datasets selected: %d", len(datasets))
 
+    s3_backup = None
+    if args.s3_backup_every_minutes is not None:
+        s3_backup = S3BackupManager(
+            datasets[0].output,
+            args.s3_backup_every_minutes,
+        )
+        LOG.info(
+            "Periodic S3 backup enabled: every %.2f minutes to s3://%s/%s.",
+            args.s3_backup_every_minutes,
+            S3_BUCKET,
+            S3_DATABASE_KEY,
+        )
+
     for index, paths in enumerate(datasets, start=1):
         LOG.info("Dataset %d/%d: %s", index, len(datasets), paths.dataset_id)
         LOG.info("Draft CSV: %s", paths.draft_file)
@@ -3236,7 +3642,14 @@ def main() -> None:
             batch_size=args.batch_size,
             overwrite=args.overwrite and index == 1,
             progress_every=args.progress_every,
+            s3_backup=s3_backup,
         ).run()
+
+    if s3_backup is not None:
+        # Ensure a successful invocation leaves the newest completed state in S3 even
+        # when the run finishes before the periodic interval elapses.
+        with duckdb.connect(str(datasets[0].output)) as con:
+            s3_backup.maybe_upload(con, reason="successful build completion", force=True)
 
 
 if __name__ == "__main__":
