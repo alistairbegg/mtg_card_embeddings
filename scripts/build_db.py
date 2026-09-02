@@ -2634,9 +2634,15 @@ class DatabaseBuilder:
             composition = {card_id: (counts[0], counts[1]) for card_id, counts in counts_by_card.items()}
             key = (draft_id, build_index)
             previous = compositions.get(key)
-            if previous is not None and previous != composition:
-                raise ValueError(f"Deck composition changed within batch for {key}")
-            compositions[key] = composition
+            if previous is None:
+                compositions[key] = composition
+            elif previous != composition:
+                LOG.warning(
+                    "Deck composition changed within batch for draft_id=%s build_index=%s; "
+                    "keeping first composition and ignoring duplicate.",
+                    draft_id,
+                    build_index,
+                )
             build_ids.append(make_build_id(draft_id, build_index))
         return build_ids, compositions
 
@@ -2675,7 +2681,10 @@ class DatabaseBuilder:
                 continue
 
             if int(existing[0]) != build_id:
-                raise ValueError(f"Deterministic build ID mismatch for {(draft_id, build_index)}")
+                raise ValueError(
+                    f"Deterministic build ID mismatch for {(draft_id, build_index)}"
+                )
+
             stored = {
                 int(card_id): (int(deck_count), int(sideboard_count))
                 for card_id, deck_count, sideboard_count in con.execute(
@@ -2687,8 +2696,14 @@ class DatabaseBuilder:
                     [build_id],
                 ).fetchall()
             }
+
             if stored != composition:
-                raise ValueError(f"Deck composition changed for {(draft_id, build_index)}")
+                LOG.warning(
+                    "Deck build already exists with different composition for "
+                    "draft_id=%s build_index=%s; keeping existing database version.",
+                    draft_id,
+                    build_index,
+                )
 
     def build_game_rows(
         self,
