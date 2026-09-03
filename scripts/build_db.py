@@ -2915,42 +2915,109 @@ class DatabaseBuilder:
         return rows
 
     def build_candidate_hand_rows(
-        self,
-        replay_batch: pd.DataFrame,
-        game_ids: list[int],
+            self,
+            replay_batch: pd.DataFrame,
+            game_ids: list[int],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         assert self.reference is not None
+
         hand_rows: list[dict[str, Any]] = []
         card_rows: list[dict[str, Any]] = []
+
         columns = ["num_mulligans", "opening_hand", *self.candidate_columns]
-        arrays = {column: replay_batch[column].to_numpy(copy=False) for column in columns if column in replay_batch.columns}
+        arrays = {
+            column: replay_batch[column].to_numpy(copy=False)
+            for column in columns
+            if column in replay_batch.columns
+        }
+
         for position, game_id in enumerate(game_ids):
             mulligans = integer_or_none(arrays["num_mulligans"][position])
-            candidates = []
-            for attempt, column in enumerate(self.candidate_columns, start=1):
+            opening_cards = split_ids(arrays["opening_hand"][position])
+
+            candidates: list[tuple[int, list[str]]] = []
+
+            for column in self.candidate_columns:
+                attempt = int(column.rsplit("_", 1)[1])
                 cards = split_ids(arrays[column][position])
-                if cards:
-                    candidates.append((attempt, cards))
-            if mulligans is None or len(candidates) != mulligans + 1:
-                raise ValueError(f"Candidate-hand count mismatch for game {game_id}")
-            if any(len(cards) != 7 for _, cards in candidates):
-                raise ValueError(f"Non-seven-card candidate hand for game {game_id}")
-            final_attempt, final_cards = candidates[-1]
-            if Counter(final_cards) != Counter(split_ids(arrays["opening_hand"][position])):
-                raise ValueError(f"opening_hand differs from final candidate for game {game_id}")
+
+                if not cards:
+                    continue
+
+                if len(cards) != 7:
+                    LOG.warning(
+                        "Source inconsistency: candidate hand %s for game %s "
+                        "contains %s cards instead of 7; skipping that candidate.",
+                        attempt,
+                        game_id,
+                        len(cards),
+                    )
+                    continue
+
+                candidates.append((attempt, cards))
+
+            if not candidates:
+                raise ValueError(
+                    f"Replay game {game_id} has no usable seven-card candidate hands"
+                )
+
+            expected_candidates = mulligans + 1 if mulligans is not None else None
+
+            if expected_candidates is None or len(candidates) != expected_candidates:
+                LOG.warning(
+                    "Source inconsistency: game %s reports num_mulligans=%r but "
+                    "contains %s usable candidate hands; preserving observed candidates.",
+                    game_id,
+                    mulligans,
+                    len(candidates),
+                )
+
+            # Prefer the candidate that exactly matches opening_hand. This identifies
+            # the kept seven-card candidate even when num_mulligans disagrees with
+            # the populated candidate_hand_N fields.
+            matching_attempts = [
+                attempt
+                for attempt, cards in candidates
+                if Counter(cards) == Counter(opening_cards)
+            ]
+
+            if matching_attempts:
+                # The same seven-card composition could theoretically appear more
+                # than once, so the latest matching source attempt is the final one.
+                final_attempt = matching_attempts[-1]
+            else:
+                # Preserve the observed candidate sequence rather than failing the
+                # entire ingestion because opening_hand disagrees with it.
+                final_attempt = candidates[-1][0]
+
+                LOG.warning(
+                    "Source inconsistency: opening_hand does not match any candidate "
+                    "hand for game %s; treating the last observed candidate "
+                    "(attempt %s) as final.",
+                    game_id,
+                    final_attempt,
+                )
+
             for attempt, cards in candidates:
                 hand_id = make_hand_id(game_id, attempt)
+
                 hand_rows.append({
-                    "hand_id": hand_id, "game_id": game_id, "attempt_number": attempt,
+                    "hand_id": hand_id,
+                    "game_id": game_id,
+                    "attempt_number": attempt,
                     "is_final_candidate": attempt == final_attempt,
                 })
+
                 for slot_number, token in enumerate(cards, start=1):
                     arena_id = parse_source_id(token)
+
                     card_rows.append({
-                        "hand_id": hand_id, "slot_number": slot_number,
+                        "hand_id": hand_id,
+                        "slot_number": slot_number,
                         "source_arena_card_id": arena_id,
                         "card_id": self.reference.arena_to_card_id.get(arena_id),
                     })
+
         return hand_rows, card_rows
 
     def build_turn_state_and_zones(
